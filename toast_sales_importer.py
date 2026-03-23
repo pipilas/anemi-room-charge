@@ -58,9 +58,22 @@ except ImportError:
 #  VERSION & UPDATE CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
 APP_VERSION = "1.0.0"
-GITHUB_REPO = "pipilas/anemi-room-charge"
-GITHUB_RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main"
-GITHUB_RELEASE_URL = f"https://github.com/{GITHUB_REPO}/releases/latest"
+GITHUB_USERNAME = "pipilas"
+GITHUB_REPO = "anemi-room-charge"
+
+# ── Updater (auto-download .app / .exe from GitHub Releases) ────────────
+try:
+    from updater import Updater as _Updater
+    _app_updater = _Updater(
+        current_version=APP_VERSION,
+        github_username=GITHUB_USERNAME,
+        github_repo=GITHUB_REPO,
+        app_name="ANEMI Room Charge",
+    )
+    UPDATER_OK = True
+except Exception:
+    _app_updater = None
+    UPDATER_OK = False
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CHARGE RECEIPT DATA & LOGIC  (Room Charge / Hotel Charge / Voucher)
@@ -1468,6 +1481,9 @@ class App(tk.Tk):
 
         # Try to load existing data on startup
         self.after(200, self._load_existing_data)
+        # Auto-check for updates on launch (non-blocking)
+        if UPDATER_OK and _app_updater:
+            _app_updater.check_and_prompt(parent_window=self)
 
     # ── Build the main screen (with inline calendar) ─────────────────────────
     def _build_ui(self):
@@ -2150,94 +2166,43 @@ class App(tk.Tk):
 
     # ── Check for updates ───────────────────────────────────────────────────────
     def _check_for_updates(self):
-        """Fetch version.txt from GitHub and compare with current version."""
+        """Use the updater package to check GitHub for new .app / .exe releases."""
         if self._running:
             return
 
-        def _worker():
-            from urllib import request as urlreq, error as urlerr
-            try:
-                version_url = f"{GITHUB_RAW_BASE}/version.txt"
-                req = urlreq.Request(version_url, headers={
-                    "User-Agent": "AnemiRoomCharge-Updater"
-                })
-                with urlreq.urlopen(req, timeout=10) as resp:
-                    remote_version = resp.read().decode().strip()
-            except Exception as exc:
-                self.after(0, lambda: messagebox.showinfo(
-                    "Update Check",
-                    f"Could not check for updates.\n\n{exc}",
-                    parent=self))
-                return
-
-            if remote_version != APP_VERSION:
-                self.after(0, lambda: self._prompt_update(remote_version))
-            else:
-                self.after(0, lambda: messagebox.showinfo(
-                    "Up to Date",
-                    f"You are running the latest version ({APP_VERSION}).",
-                    parent=self))
-
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _prompt_update(self, remote_version: str):
-        """Ask user if they want to download the latest version."""
-        answer = messagebox.askyesno(
-            "Update Available",
-            f"A new version is available!\n\n"
-            f"Current: {APP_VERSION}\n"
-            f"Latest:  {remote_version}\n\n"
-            f"Download the update now?",
-            parent=self)
-        if not answer:
-            return
-
-        save_dir = filedialog.askdirectory(
-            title="Choose folder to save the update",
-            parent=self)
-        if not save_dir:
-            return
-
-        def _download():
-            from urllib import request as urlreq
-            files_to_download = [
-                "toast_sales_importer.py",
-                "auth_manager.py",
-                "version.txt",
-            ]
-            downloaded = []
-            for fname in files_to_download:
+        if UPDATER_OK and _app_updater:
+            def _worker():
                 try:
-                    url = f"{GITHUB_RAW_BASE}/{fname}"
-                    req = urlreq.Request(url, headers={
-                        "User-Agent": "AnemiRoomCharge-Updater"
-                    })
-                    with urlreq.urlopen(req, timeout=15) as resp:
-                        content = resp.read()
-                    out_path = Path(save_dir) / fname
-                    out_path.write_bytes(content)
-                    downloaded.append(fname)
-                except Exception:
-                    pass
+                    result = _app_updater.check_for_updates()
+                except Exception as exc:
+                    self.after(0, lambda: messagebox.showinfo(
+                        "Update Check",
+                        f"Could not check for updates.\n\n{exc}",
+                        parent=self))
+                    return
 
-            def _done():
-                if downloaded:
-                    messagebox.showinfo(
-                        "Update Downloaded",
-                        f"Downloaded {len(downloaded)} file(s) to:\n"
-                        f"{save_dir}\n\n"
-                        f"Files: {', '.join(downloaded)}\n\n"
-                        f"Replace your current files and restart the app.",
-                        parent=self)
+                if result.get("update_available"):
+                    self.after(0, lambda: self._show_update_dialog(result))
                 else:
-                    messagebox.showerror(
-                        "Download Failed",
-                        "Could not download update files.\n"
-                        "Check your internet connection.",
-                        parent=self)
-            self.after(0, _done)
+                    self.after(0, lambda: messagebox.showinfo(
+                        "Up to Date",
+                        f"You are running the latest version ({APP_VERSION}).",
+                        parent=self))
 
-        threading.Thread(target=_download, daemon=True).start()
+            threading.Thread(target=_worker, daemon=True).start()
+        else:
+            messagebox.showinfo(
+                "Update Check",
+                "Updater module not available.",
+                parent=self)
+
+    def _show_update_dialog(self, result):
+        """Show the update dialog from the updater package."""
+        try:
+            from updater.update_dialog import show_update_dialog
+            show_update_dialog(self, _app_updater, result)
+        except Exception as exc:
+            messagebox.showerror("Update Error", str(exc), parent=self)
 
     # ── Sign out ───────────────────────────────────────────────────────────────
     def _sign_out(self):
