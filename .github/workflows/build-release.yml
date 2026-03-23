@@ -24,7 +24,7 @@ jobs:
 
       - name: Create Firebase config
         run: |
-          mkdir config
+          mkdir -p config
           echo '{"api_key": "${{ secrets.FIREBASE_API_KEY }}", "project_id": "${{ secrets.FIREBASE_PROJECT_ID }}"}' > config/firebase.json
         shell: bash
 
