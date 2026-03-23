@@ -809,8 +809,19 @@ def _app_dir() -> Path:
         return exe.parent
     return Path(__file__).resolve().parent
 
-SFTP_DEFAULT_KEY = _app_dir() / "keys" / "toast_rsa_key"
-SFTP_DEFAULT_OUT = _app_dir() / "toast_exports"
+def _default_data_dir() -> Path:
+    """User-writable data directory for keys, exports, etc."""
+    if platform.system() == "Darwin":
+        d = Path.home() / "Library" / "Application Support" / "AnemiRoomCharge"
+    elif platform.system() == "Windows":
+        d = Path(os.environ.get("APPDATA", Path.home())) / "AnemiRoomCharge"
+    else:
+        d = Path.home() / ".anemi-room-charge"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+SFTP_DEFAULT_KEY = _default_data_dir() / "keys" / "toast_rsa_key"
+SFTP_DEFAULT_OUT = _default_data_dir() / "toast_exports"
 
 # Files needed for receipt generation (always downloaded)
 SFTP_REQUIRED_FILES = [
