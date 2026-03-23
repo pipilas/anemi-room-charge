@@ -57,7 +57,7 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════════
 #  VERSION & UPDATE CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
-APP_VERSION = "1.0.6"
+APP_VERSION = "1.0.7"
 GITHUB_USERNAME = "pipilas"
 GITHUB_REPO = "anemi-room-charge"
 
@@ -1579,13 +1579,32 @@ class App(tk.Tk):
             w.bind("<Leave>", self._start_hover_out)
             w.bind("<Button-1>", lambda e: self._on_start())
 
+        # Export This Month PDF button
+        self._export_this_frame = tk.Frame(action_bar, bg=ACCENT,
+                                           highlightbackground=ACCENT,
+                                           highlightthickness=1, cursor="hand2")
+        self._export_this_frame.pack(side="left", padx=(10, 0))
+        self._export_this_lbl = tk.Label(
+            self._export_this_frame, text="Export This Month", bg=ACCENT,
+            fg="#FFFFFF", font=(FONT, 11, "bold"), padx=16, pady=8,
+            cursor="hand2")
+        self._export_this_lbl.pack()
+        for w in (self._export_this_frame, self._export_this_lbl):
+            w.bind("<Enter>", lambda e: (
+                self._export_this_frame.config(bg=ACCENT_HV, highlightbackground=ACCENT_HV),
+                self._export_this_lbl.config(bg=ACCENT_HV)))
+            w.bind("<Leave>", lambda e: (
+                self._export_this_frame.config(bg=ACCENT, highlightbackground=ACCENT),
+                self._export_this_lbl.config(bg=ACCENT)))
+            w.bind("<Button-1>", lambda e: self._export_month_pdf("this"))
+
         # Export Last Month PDF button
         self._export_frame = tk.Frame(action_bar, bg="#374151",
                                       highlightbackground="#374151",
                                       highlightthickness=1, cursor="hand2")
         self._export_frame.pack(side="left", padx=(10, 0))
         self._export_lbl = tk.Label(
-            self._export_frame, text="Export Last Month PDF", bg="#374151",
+            self._export_frame, text="Export Last Month", bg="#374151",
             fg="#FFFFFF", font=(FONT, 11, "bold"), padx=16, pady=8,
             cursor="hand2")
         self._export_lbl.pack()
@@ -1596,7 +1615,7 @@ class App(tk.Tk):
             w.bind("<Leave>", lambda e: (
                 self._export_frame.config(bg="#374151", highlightbackground="#374151"),
                 self._export_lbl.config(bg="#374151")))
-            w.bind("<Button-1>", lambda e: self._export_last_month())
+            w.bind("<Button-1>", lambda e: self._export_month_pdf("last"))
 
         self._status_lbl = tk.Label(action_bar, text="", bg=BG_NAV,
                                     fg=NAV_INACTIVE, font=(FONT, 11))
@@ -2200,18 +2219,14 @@ class App(tk.Tk):
             self._pulse(msg)
         self.after(0, _do)
 
-    # ── Export Last Month PDF ─────────────────────────────────────────────────
-    def _export_last_month(self):
-        """Generate last month's combined PDF and let user choose save location."""
+    # ── Export Month PDF (this or last) ──────────────────────────────────────
+    def _export_month_pdf(self, which: str = "this"):
+        """
+        Generate a combined PDF for this month or last month.
+        Tries local files first, then Firebase data.
+        which: "this" for current month, "last" for previous month.
+        """
         if self._running:
-            return
-
-        out_dir = self._settings.get("output_folder", str(SFTP_DEFAULT_OUT))
-        export_path = Path(out_dir)
-
-        if not export_path.exists():
-            messagebox.showinfo("No Data", "No export data found yet.\n"
-                                "Run 'Get Weekly Orders' first.", parent=self)
             return
 
         if not REPORTLAB_OK:
@@ -2221,21 +2236,28 @@ class App(tk.Tk):
                                  parent=self)
             return
 
-        # Determine last month
+        # Determine the date range
         today = datetime.date.today()
-        first_of_this_month = today.replace(day=1)
-        last_day_prev = first_of_this_month - datetime.timedelta(days=1)
-        first_of_prev = last_day_prev.replace(day=1)
+        if which == "last":
+            first_of_this_month = today.replace(day=1)
+            last_day = first_of_this_month - datetime.timedelta(days=1)
+            first_day = last_day.replace(day=1)
+        else:
+            first_day = today.replace(day=1)
+            last_day = today  # up to today
 
-        month_label = first_of_prev.strftime("%m-%Y")  # e.g. "02-2026"
-        month_display = first_of_prev.strftime("%B %Y")  # e.g. "February 2026"
+        month_label = first_day.strftime("%m-%Y")    # e.g. "03-2026"
+        month_display = first_day.strftime("%B %Y")  # e.g. "March 2026"
 
-        # Check if a monthly PDF already exists in charge_receipts
+        # ── Try local files first ────────────────────────────────────────
+        month_receipts = []
+        out_dir = self._settings.get("output_folder", str(SFTP_DEFAULT_OUT))
+        export_path = Path(out_dir)
+
+        # Check for existing generated PDF
         receipts_dir = export_path / "charge_receipts"
-        existing_pdf = receipts_dir / f"{month_label}.pdf" if receipts_dir.exists() else None
-
-        if existing_pdf and existing_pdf.exists():
-            # Monthly PDF already generated — just let user save it
+        existing_pdf = receipts_dir / f"{month_label}.pdf"
+        if which == "last" and existing_pdf.exists():
             save_path = filedialog.asksaveasfilename(
                 title=f"Export {month_display} PDF",
                 initialfile=f"{month_label}.pdf",
@@ -2253,18 +2275,59 @@ class App(tk.Tk):
                                          parent=self)
             return
 
-        # No existing monthly PDF — try to generate from data
-        all_receipts = find_room_charges(export_path)
-        last_month_receipts = []
-        for r in all_receipts:
+        # Try local CSV data
+        if export_path.exists():
             try:
-                dt = datetime.datetime.strptime(r.date_folder, "%Y%m%d").date()
-                if first_of_prev <= dt <= last_day_prev:
-                    last_month_receipts.append(r)
-            except ValueError:
-                continue
+                all_receipts = find_room_charges(export_path)
+                for r in all_receipts:
+                    try:
+                        dt = datetime.datetime.strptime(r.date_folder, "%Y%m%d").date()
+                        if first_day <= dt <= last_day:
+                            month_receipts.append(r)
+                    except ValueError:
+                        continue
+            except Exception:
+                pass
 
-        if not last_month_receipts:
+        # ── Fall back to Firebase if no local data ───────────────────────
+        if not month_receipts and AUTH_OK and hasattr(self, "_id_token") and self._id_token:
+            try:
+                # Generate all date keys for the month range
+                date_keys = []
+                d = first_day
+                while d <= last_day:
+                    date_keys.append(d.strftime("%Y%m%d"))
+                    d += datetime.timedelta(days=1)
+
+                orders = auth.fetch_orders(self._id_token, date_keys)
+                for o in orders:
+                    items = []
+                    for it in o.get("items", []):
+                        items.append(ReceiptItem(
+                            name=str(it.get("name", "")),
+                            qty=float(it.get("qty", 0)),
+                            net_price=float(it.get("net_price", 0)),
+                            tax=float(it.get("tax", 0)),
+                        ))
+                    month_receipts.append(RoomChargeReceipt(
+                        date_folder=str(o.get("date_folder", "")),
+                        check_id=str(o.get("check_id", "")),
+                        check_number=str(o.get("check_number", "")),
+                        tab_name=str(o.get("tab_name", "")),
+                        server=str(o.get("server", "")),
+                        table=str(o.get("table", "")),
+                        paid_date=str(o.get("paid_date", "")),
+                        subtotal=float(o.get("subtotal", 0)),
+                        tax_total=float(o.get("tax_total", 0)),
+                        tip=float(o.get("tip", 0)),
+                        total=float(o.get("total", 0)),
+                        charge_type=str(o.get("charge_type", "Room Charge")),
+                        items=items,
+                    ))
+            except Exception:
+                pass
+
+        if not month_receipts:
             messagebox.showinfo("No Data",
                                 f"No charge receipts found for {month_display}.",
                                 parent=self)
@@ -2281,8 +2344,9 @@ class App(tk.Tk):
             return
 
         try:
-            generate_combined_pdf(last_month_receipts, Path(save_path))
-            Toast(self, f"Exported {month_display} — {len(last_month_receipts)} receipts!")
+            generate_combined_pdf(month_receipts, Path(save_path))
+            Toast(self, f"Exported {month_display} — "
+                        f"{len(month_receipts)} receipts!")
         except Exception as exc:
             messagebox.showerror("Export Error",
                                  f"Failed to generate PDF:\n{exc}",
