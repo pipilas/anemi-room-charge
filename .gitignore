@@ -8,7 +8,8 @@ build/
 
 # App data
 toast_exports/
-config/settings.json
+config/*
+!config/firebase.json.example
 keys/
 
 # OS

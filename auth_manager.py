@@ -17,8 +17,30 @@ from pathlib import Path
 from urllib import request, error, parse
 
 # ── Firebase project config ──────────────────────────────────────────────────
-FIREBASE_API_KEY = "AIzaSyArw4CIzor4GDJGYM95X4KdfMbypWtcbRg"
-FIREBASE_PROJECT_ID = "room-charge"
+# Loaded from config/firebase.json (git-ignored) so keys stay out of the repo.
+# Falls back to environment variables FIREBASE_API_KEY / FIREBASE_PROJECT_ID.
+
+def _load_firebase_config() -> tuple[str, str]:
+    """Return (api_key, project_id) from config file or env vars."""
+    cfg_path = Path(__file__).resolve().parent / "config" / "firebase.json"
+    if cfg_path.exists():
+        try:
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            return data["api_key"], data["project_id"]
+        except Exception:
+            pass
+    # Fallback to environment variables
+    api_key = os.environ.get("FIREBASE_API_KEY", "")
+    project_id = os.environ.get("FIREBASE_PROJECT_ID", "")
+    if api_key and project_id:
+        return api_key, project_id
+    raise RuntimeError(
+        "Firebase config not found.  Create config/firebase.json with "
+        '{"api_key": "...", "project_id": "..."} or set FIREBASE_API_KEY '
+        "and FIREBASE_PROJECT_ID environment variables."
+    )
+
+FIREBASE_API_KEY, FIREBASE_PROJECT_ID = _load_firebase_config()
 
 _AUTH_URL = (
     "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword"
