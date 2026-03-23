@@ -20,12 +20,30 @@ from urllib import request, error, parse
 # Loaded from config/firebase.json (git-ignored) so keys stay out of the repo.
 # Falls back to environment variables FIREBASE_API_KEY / FIREBASE_PROJECT_ID.
 
+def _app_root() -> Path:
+    """Return the app root — works both for normal Python and PyInstaller bundles."""
+    import sys
+    if getattr(sys, 'frozen', False):
+        # Running as PyInstaller bundle
+        return Path(sys._MEIPASS)
+    return Path(__file__).resolve().parent
+
+
 def _load_firebase_config() -> tuple[str, str]:
     """Return (api_key, project_id) from config file or env vars."""
-    cfg_path = Path(__file__).resolve().parent / "config" / "firebase.json"
+    # Check bundled / local config
+    cfg_path = _app_root() / "config" / "firebase.json"
     if cfg_path.exists():
         try:
             data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            return data["api_key"], data["project_id"]
+        except Exception:
+            pass
+    # Also check next to the script (for development)
+    cfg_path2 = Path(__file__).resolve().parent / "config" / "firebase.json"
+    if cfg_path2.exists():
+        try:
+            data = json.loads(cfg_path2.read_text(encoding="utf-8"))
             return data["api_key"], data["project_id"]
         except Exception:
             pass

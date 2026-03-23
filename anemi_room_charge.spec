@@ -24,6 +24,7 @@ a = Analysis(
         ('version.txt', '.'),
         ('version.json', '.'),
         ('updater', 'updater'),
+        ('config/firebase.json', 'config'),
     ],
     hiddenimports=[
         'updater',
