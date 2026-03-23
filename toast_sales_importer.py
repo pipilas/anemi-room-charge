@@ -57,7 +57,7 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════════
 #  VERSION & UPDATE CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.5"
 GITHUB_USERNAME = "pipilas"
 GITHUB_REPO = "anemi-room-charge"
 
@@ -1930,10 +1930,10 @@ class App(tk.Tk):
         self._log.delete("1.0", "end")
         self._log.config(state="disabled")
 
+        # Always fetch the last 7 days (today + 6 days back)
         today = datetime.date.today()
-        monday = today - datetime.timedelta(days=today.weekday())
-        dates = [(monday + datetime.timedelta(days=i)).strftime("%Y%m%d")
-                 for i in range(7)]
+        dates = [(today - datetime.timedelta(days=i)).strftime("%Y%m%d")
+                 for i in range(6, -1, -1)]
 
         threading.Thread(
             target=self._full_pipeline_worker,
