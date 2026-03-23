@@ -394,3 +394,83 @@ def check_order_exists(id_token: str, date_folder: str,
             return True
     except Exception:
         return False
+
+
+def _parse_firestore_value(val_obj) -> object:
+    """Convert a single Firestore value object back to Python."""
+    if "stringValue" in val_obj:
+        return val_obj["stringValue"]
+    elif "booleanValue" in val_obj:
+        return val_obj["booleanValue"]
+    elif "integerValue" in val_obj:
+        return int(val_obj["integerValue"])
+    elif "doubleValue" in val_obj:
+        return float(val_obj["doubleValue"])
+    elif "arrayValue" in val_obj:
+        return [_parse_firestore_value(v)
+                for v in val_obj.get("arrayValue", {}).get("values", [])]
+    elif "mapValue" in val_obj:
+        fields = val_obj.get("mapValue", {}).get("fields", {})
+        return {k: _parse_firestore_value(v) for k, v in fields.items()}
+    return str(val_obj)
+
+
+def fetch_orders(id_token: str, date_folders: list[str] | None = None) -> list[dict]:
+    """
+    Fetch orders from Firestore.  If date_folders is given, only returns
+    orders whose date_folder field is in that list.
+
+    Uses a Firestore REST query (runQuery) to list all /orders docs.
+    Returns a list of plain dicts.
+    """
+    url = f"{_FIRESTORE_URL}:runQuery"
+
+    # Structured query: select all from 'orders' collection
+    query = {
+        "structuredQuery": {
+            "from": [{"collectionId": "orders"}],
+            "limit": 500,
+        }
+    }
+
+    # If specific dates requested, add a filter
+    if date_folders:
+        query["structuredQuery"]["where"] = {
+            "fieldFilter": {
+                "field": {"fieldPath": "date_folder"},
+                "op": "IN",
+                "value": {
+                    "arrayValue": {
+                        "values": [{"stringValue": d} for d in date_folders]
+                    }
+                }
+            }
+        }
+
+    payload = json.dumps(query).encode("utf-8")
+    req = request.Request(
+        url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {id_token}",
+        },
+        method="POST",
+    )
+
+    try:
+        with request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception:
+        return []
+
+    orders = []
+    for item in data:
+        doc = item.get("document")
+        if not doc:
+            continue
+        fields = doc.get("fields", {})
+        order = {k: _parse_firestore_value(v) for k, v in fields.items()}
+        orders.append(order)
+
+    return orders

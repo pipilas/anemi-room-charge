@@ -57,7 +57,7 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════════
 #  VERSION & UPDATE CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 GITHUB_USERNAME = "pipilas"
 GITHUB_REPO = "anemi-room-charge"
 
@@ -798,8 +798,19 @@ SFTP_HOST       = "s-9b0f88558b264dfda.server.transfer.us-east-1.amazonaws.com"
 SFTP_PORT       = 22
 SFTP_USERNAME   = "MamakaMeditteraneanDataExports"
 SFTP_EXPORT_ID  = "287721"
-SFTP_DEFAULT_KEY = Path(__file__).resolve().parent / "keys" / "toast_rsa_key"
-SFTP_DEFAULT_OUT = Path(__file__).resolve().parent / "toast_exports"
+def _app_dir() -> Path:
+    """Return the real app directory (not the PyInstaller temp dir)."""
+    if getattr(sys, 'frozen', False):
+        # Bundled app — use the directory containing the executable
+        exe = Path(sys.executable).resolve()
+        if platform.system() == "Darwin":
+            # .app/Contents/MacOS/exe → go up 3 to folder containing .app
+            return exe.parent.parent.parent.parent
+        return exe.parent
+    return Path(__file__).resolve().parent
+
+SFTP_DEFAULT_KEY = _app_dir() / "keys" / "toast_rsa_key"
+SFTP_DEFAULT_OUT = _app_dir() / "toast_exports"
 
 # Files needed for receipt generation (always downloaded)
 SFTP_REQUIRED_FILES = [
@@ -1751,12 +1762,14 @@ class App(tk.Tk):
         if export_path.exists():
             try:
                 all_receipts = find_room_charges(export_path)
-                self._refresh_calendar(all_receipts)
-                return
+                if all_receipts:
+                    self._refresh_calendar(all_receipts)
+                    return
             except Exception:
                 pass
-        # No data — show empty cards
+        # Fall back to Firebase, or show empty cards
         self._refresh_calendar([])
+        self._load_from_firebase()
 
     # ── Refresh all day cards with new receipt data ───────────────────────────
     def _refresh_calendar(self, receipts: list[RoomChargeReceipt]):
@@ -1780,6 +1793,7 @@ class App(tk.Tk):
 
     # ── Load existing data on startup ─────────────────────────────────────────
     def _load_existing_data(self):
+        """Load calendar data — tries local files first, then Firebase."""
         out_dir = self._settings.get("output_folder", str(SFTP_DEFAULT_OUT))
         export_path = Path(out_dir)
         if export_path.exists():
@@ -1787,8 +1801,53 @@ class App(tk.Tk):
                 receipts = find_room_charges(export_path)
                 if receipts:
                     self._refresh_calendar(receipts)
+                    return
             except Exception:
                 pass
+        # Fall back to Firebase
+        self._load_from_firebase()
+
+    def _load_from_firebase(self):
+        """Fetch orders from Firestore and populate the calendar."""
+        if not AUTH_OK or not hasattr(self, "_id_token") or not self._id_token:
+            return
+
+        date_keys = [dt.strftime("%Y%m%d") for dt in self._dates]
+
+        def _worker():
+            try:
+                orders = auth.fetch_orders(self._id_token, date_keys)
+                receipts = []
+                for o in orders:
+                    items = []
+                    for it in o.get("items", []):
+                        items.append(ReceiptItem(
+                            name=str(it.get("name", "")),
+                            qty=float(it.get("qty", 0)),
+                            net_price=float(it.get("net_price", 0)),
+                            tax=float(it.get("tax", 0)),
+                        ))
+                    receipts.append(RoomChargeReceipt(
+                        date_folder=str(o.get("date_folder", "")),
+                        check_id=str(o.get("check_id", "")),
+                        check_number=str(o.get("check_number", "")),
+                        tab_name=str(o.get("tab_name", "")),
+                        server=str(o.get("server", "")),
+                        table=str(o.get("table", "")),
+                        paid_date=str(o.get("paid_date", "")),
+                        subtotal=float(o.get("subtotal", 0)),
+                        tax_total=float(o.get("tax_total", 0)),
+                        tip=float(o.get("tip", 0)),
+                        total=float(o.get("total", 0)),
+                        charge_type=str(o.get("charge_type", "Room Charge")),
+                        items=items,
+                    ))
+                if receipts:
+                    self.after(0, lambda: self._refresh_calendar(receipts))
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     # ── Show day detail view ──────────────────────────────────────────────────
     def _show_day(self, date_key: str, receipts: list[RoomChargeReceipt]):
