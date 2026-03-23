@@ -57,7 +57,7 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════════
 #  VERSION & UPDATE CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 GITHUB_USERNAME = "pipilas"
 GITHUB_REPO = "anemi-room-charge"
 
@@ -833,7 +833,7 @@ SFTP_REQUIRED_FILES = [
 # ═══════════════════════════════════════════════════════════════════════════════
 #  PATHS & SETTINGS PERSISTENCE
 # ═══════════════════════════════════════════════════════════════════════════════
-APP_DIR    = Path(__file__).resolve().parent
+APP_DIR    = _default_data_dir()
 CONFIG_DIR = APP_DIR / "config"
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
 

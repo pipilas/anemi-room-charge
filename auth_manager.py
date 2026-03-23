@@ -420,42 +420,16 @@ def fetch_orders(id_token: str, date_folders: list[str] | None = None) -> list[d
     Fetch orders from Firestore.  If date_folders is given, only returns
     orders whose date_folder field is in that list.
 
-    Uses a Firestore REST query (runQuery) to list all /orders docs.
+    Uses the Firestore REST list endpoint to get all /orders docs,
+    then filters client-side (avoids needing composite indexes).
     Returns a list of plain dicts.
     """
-    url = f"{_FIRESTORE_URL}:runQuery"
+    url = f"{_FIRESTORE_URL}/orders?pageSize=500"
 
-    # Structured query: select all from 'orders' collection
-    query = {
-        "structuredQuery": {
-            "from": [{"collectionId": "orders"}],
-            "limit": 500,
-        }
-    }
-
-    # If specific dates requested, add a filter
-    if date_folders:
-        query["structuredQuery"]["where"] = {
-            "fieldFilter": {
-                "field": {"fieldPath": "date_folder"},
-                "op": "IN",
-                "value": {
-                    "arrayValue": {
-                        "values": [{"stringValue": d} for d in date_folders]
-                    }
-                }
-            }
-        }
-
-    payload = json.dumps(query).encode("utf-8")
     req = request.Request(
         url,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {id_token}",
-        },
-        method="POST",
+        headers={"Authorization": f"Bearer {id_token}"},
+        method="GET",
     )
 
     try:
@@ -465,12 +439,14 @@ def fetch_orders(id_token: str, date_folders: list[str] | None = None) -> list[d
         return []
 
     orders = []
-    for item in data:
-        doc = item.get("document")
-        if not doc:
-            continue
+    for doc in data.get("documents", []):
         fields = doc.get("fields", {})
         order = {k: _parse_firestore_value(v) for k, v in fields.items()}
         orders.append(order)
+
+    # Filter client-side if specific dates requested
+    if date_folders:
+        date_set = set(date_folders)
+        orders = [o for o in orders if o.get("date_folder") in date_set]
 
     return orders

@@ -1,10 +1,10 @@
 {
-  "latest_version": "1.0.2",
+  "latest_version": "1.0.3",
   "minimum_version": "1.0.0",
   "release_date": "2026-03-23",
   "download_url_windows": "",
   "download_url_mac": "",
-  "release_notes": "Fix macOS auto-updater hanging during install",
+  "release_notes": "Fix settings persistence and Firebase data loading for bundled app",
   "mandatory": false,
   "checksum_sha256": ""
 }
