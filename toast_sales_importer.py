@@ -57,7 +57,7 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════════
 #  VERSION & UPDATE CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
-APP_VERSION = "1.0.5"
+APP_VERSION = "1.0.6"
 GITHUB_USERNAME = "pipilas"
 GITHUB_REPO = "anemi-room-charge"
 
@@ -1503,6 +1503,9 @@ class App(tk.Tk):
 
         # Try to load existing data on startup
         self.after(200, self._load_existing_data)
+        # First-run setup: if admin has no SSH key configured, prompt
+        if self._user_role == "admin":
+            self.after(400, self._check_first_run_setup)
         # Auto-check for updates on launch (non-blocking)
         if UPDATER_OK and _app_updater:
             _app_updater.check_and_prompt(parent_window=self)
@@ -1883,6 +1886,57 @@ class App(tk.Tk):
         bg = START_ACTIVE if self._running else ACCENT
         self._start_frame.config(bg=bg, highlightbackground=bg)
         self._start_lbl.config(bg=bg)
+
+    # ── First-run setup wizard ─────────────────────────────────────────────────
+    def _check_first_run_setup(self):
+        """If no SSH key is configured, prompt the admin to set one up."""
+        key_path = self._settings.get("ssh_key", str(SFTP_DEFAULT_KEY))
+        if Path(key_path).exists():
+            return  # Already set up
+
+        answer = messagebox.askyesno(
+            "Welcome — First-Time Setup",
+            "No SSH key is configured for fetching data from Toast.\n\n"
+            "Would you like to select your SSH key file now?\n\n"
+            "(You can also do this later via the \u2699 Settings icon.)",
+            parent=self)
+        if not answer:
+            return
+
+        key_file = filedialog.askopenfilename(
+            title="Select your Toast SSH key file",
+            filetypes=[("All files", "*"), ("PEM files", "*.pem"),
+                       ("Key files", "*.key")],
+            parent=self)
+        if not key_file:
+            return
+
+        # Copy the key to the app data directory
+        import shutil
+        dest_dir = _default_data_dir() / "keys"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_file = dest_dir / Path(key_file).name
+        try:
+            shutil.copy2(key_file, dest_file)
+            # Fix permissions on macOS/Linux
+            if platform.system() != "Windows":
+                dest_file.chmod(0o600)
+        except Exception as exc:
+            messagebox.showerror(
+                "Setup Error",
+                f"Could not copy key file:\n{exc}",
+                parent=self)
+            return
+
+        # Save the path in settings
+        self._settings["ssh_key"] = str(dest_file)
+        _save_settings(self._settings)
+
+        messagebox.showinfo(
+            "Setup Complete",
+            f"SSH key saved to:\n{dest_file}\n\n"
+            "You're all set! Click 'Get Weekly Orders' to fetch data.",
+            parent=self)
 
     # ── Start action ──────────────────────────────────────────────────────────
     def _on_start(self):
