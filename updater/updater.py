@@ -180,88 +180,99 @@ class Updater:
 
     def _install_mac(self, dmg_path, _status):
         """
-        macOS auto-install:
-        1. Mount the DMG
-        2. Find the .app inside
-        3. Copy it to /Applications (replacing old version)
-        4. Unmount the DMG
-        5. Relaunch from /Applications
+        macOS auto-install using a background shell script.
+
+        The script runs AFTER the app exits, so there are no file-lock
+        issues when replacing the .app bundle in /Applications.
+
+        Flow:
+        1. Write a temp shell script that will:
+           a. Wait for this process to exit
+           b. Mount the DMG
+           c. Copy the .app to /Applications
+           d. Unmount the DMG
+           e. Relaunch the new .app
+           f. Clean up
+        2. Launch the script in the background
+        3. Exit the current app immediately
         """
-        mount_point = None
-        try:
-            # ── Step 1: Mount DMG ────────────────────────────────────────
-            _status("Mounting disk image...")
-            result = subprocess.run(
-                ["hdiutil", "attach", dmg_path,
-                 "-nobrowse", "-noverify", "-noautoopen"],
-                capture_output=True, text=True, timeout=60
-            )
-            if result.returncode != 0:
-                raise RuntimeError(f"Failed to mount DMG: {result.stderr}")
+        import tempfile
 
-            # Parse mount point from hdiutil output
-            for line in result.stdout.strip().split("\n"):
-                parts = line.split("\t")
-                if len(parts) >= 3:
-                    mount_point = parts[-1].strip()
+        _status("Preparing update...")
 
-            if not mount_point or not os.path.isdir(mount_point):
-                raise RuntimeError("Could not determine DMG mount point.")
+        # Build a shell script that does the heavy lifting after we quit
+        script_content = f'''#!/bin/bash
+# Wait for the current app to fully exit
+sleep 2
 
-            # ── Step 2: Find the .app ────────────────────────────────────
-            _status("Finding application...")
-            app_name = None
-            for item in os.listdir(mount_point):
-                if item.endswith(".app"):
-                    app_name = item
-                    break
-            if not app_name:
-                raise RuntimeError("No .app found inside the DMG.")
+# Mount the DMG
+MOUNT_OUTPUT=$(hdiutil attach "{dmg_path}" -nobrowse -noverify -noautoopen 2>&1)
+if [ $? -ne 0 ]; then
+    osascript -e 'display alert "Update Failed" message "Could not mount the disk image. Please install manually from the Downloads folder."'
+    exit 1
+fi
 
-            source_app = os.path.join(mount_point, app_name)
-            dest_app = os.path.join("/Applications", app_name)
+# Find mount point (last column of last line)
+MOUNT_POINT=$(echo "$MOUNT_OUTPUT" | tail -1 | awk '{{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}}' | sed 's/ *$//')
 
-            # ── Step 3: Remove old version and copy new one ──────────────
-            _status("Installing update...")
-            if os.path.exists(dest_app):
-                shutil.rmtree(dest_app)
-            shutil.copytree(source_app, dest_app)
-            _status("Update installed!")
+if [ ! -d "$MOUNT_POINT" ]; then
+    osascript -e 'display alert "Update Failed" message "Could not find mounted volume."'
+    exit 1
+fi
 
-            # ── Step 4: Unmount DMG ──────────────────────────────────────
-            try:
-                subprocess.run(
-                    ["hdiutil", "detach", mount_point, "-quiet"],
-                    timeout=30, capture_output=True
-                )
-            except Exception:
-                pass  # Non-critical
+# Find the .app inside
+APP_NAME=$(ls "$MOUNT_POINT" | grep '\\.app$' | head -1)
+if [ -z "$APP_NAME" ]; then
+    hdiutil detach "$MOUNT_POINT" -quiet 2>/dev/null
+    osascript -e 'display alert "Update Failed" message "No application found in the disk image."'
+    exit 1
+fi
 
-            # Clean up downloaded DMG
-            try:
-                os.remove(dmg_path)
-            except Exception:
-                pass
+SOURCE="$MOUNT_POINT/$APP_NAME"
+DEST="/Applications/$APP_NAME"
 
-            # ── Step 5: Relaunch ─────────────────────────────────────────
-            _status("Relaunching...")
-            import time
-            time.sleep(1)
-            subprocess.Popen(["open", "-n", "-a", dest_app])
-            time.sleep(0.5)
-            os._exit(0)
+# Remove old version and copy new one
+rm -rf "$DEST" 2>/dev/null
+cp -R "$SOURCE" "$DEST"
 
-        except Exception as e:
-            # Try to unmount on error
-            if mount_point:
-                try:
-                    subprocess.run(
-                        ["hdiutil", "detach", mount_point, "-quiet"],
-                        timeout=15, capture_output=True
-                    )
-                except Exception:
-                    pass
-            raise RuntimeError(f"macOS install failed: {e}")
+if [ $? -ne 0 ]; then
+    hdiutil detach "$MOUNT_POINT" -quiet 2>/dev/null
+    osascript -e 'display alert "Update Failed" message "Could not copy to Applications. Try dragging the app manually."'
+    open "$MOUNT_POINT"
+    exit 1
+fi
+
+# Unmount and clean up
+hdiutil detach "$MOUNT_POINT" -quiet 2>/dev/null
+rm -f "{dmg_path}" 2>/dev/null
+
+# Relaunch
+sleep 1
+open -n -a "$DEST"
+
+# Delete this script
+rm -f "$0"
+'''
+
+        # Write script to temp file
+        script_path = os.path.join(tempfile.gettempdir(), "anemi_update.sh")
+        with open(script_path, "w") as f:
+            f.write(script_content)
+        os.chmod(script_path, 0o755)
+
+        _status("Installing update — app will restart...")
+
+        # Launch the script in background and exit
+        subprocess.Popen(
+            ["/bin/bash", script_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+        import time
+        time.sleep(0.5)
+        os._exit(0)
 
     def check_and_prompt(self, parent_window=None):
         """
