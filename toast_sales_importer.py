@@ -18,6 +18,7 @@ import io
 import json
 import os
 import platform
+import subprocess
 import sys
 import threading
 import time
@@ -25,9 +26,20 @@ import zipfile
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from tkinter import ttk, messagebox, filedialog
+
+# ── Windows DPI awareness (must be set BEFORE importing tkinter) ─────────
+if platform.system() == "Windows":
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)   # Per-monitor DPI aware
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()     # Fallback for Win 8.0
+        except Exception:
+            pass
 
 import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
 
 # ── Auth module ──────────────────────────────────────────────────────────────
 try:
@@ -57,7 +69,7 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════════
 #  VERSION & UPDATE CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
-APP_VERSION = "1.0.7"
+APP_VERSION = "1.2.0"
 GITHUB_USERNAME = "pipilas"
 GITHUB_REPO = "anemi-room-charge"
 
@@ -68,7 +80,7 @@ try:
         current_version=APP_VERSION,
         github_username=GITHUB_USERNAME,
         github_repo=GITHUB_REPO,
-        app_name="ANEMI Room Charge",
+        app_name="Sales-ANEMI",
     )
     UPDATER_OK = True
 except Exception:
@@ -229,6 +241,182 @@ def find_room_charges(export_dir: Path) -> list[RoomChargeReceipt]:
     return receipts
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DAILY SALES SUMMARY — Computed from PaymentDetails + CheckDetails CSVs
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class DaypartSales:
+    """Sales figures for a single daypart (Breakfast, Dinner, etc.)."""
+    name: str
+    orders: int = 0
+    gross_sales: float = 0.0
+    net_sales: float = 0.0
+    discount: float = 0.0
+    tax: float = 0.0
+    tips: float = 0.0      # includes gratuity (auto-grat)
+    admin_fee: float = 0.0  # V/MC/D processing fees
+    refund: float = 0.0
+
+
+@dataclass
+class DailySalesSummary:
+    """Complete daily sales breakdown with daypart detail."""
+    date_folder: str
+    dayparts: list[DaypartSales] = field(default_factory=list)
+    void_amount: float = 0.0
+    void_count: int = 0
+    total_orders: int = 0
+    total_guests: int = 0
+
+    @property
+    def total_gross(self) -> float:
+        return sum(d.gross_sales for d in self.dayparts)
+
+    @property
+    def total_net(self) -> float:
+        return sum(d.net_sales for d in self.dayparts)
+
+    @property
+    def total_discount(self) -> float:
+        return sum(d.discount for d in self.dayparts)
+
+    @property
+    def total_tax(self) -> float:
+        return sum(d.tax for d in self.dayparts)
+
+    @property
+    def total_tips(self) -> float:
+        return sum(d.tips for d in self.dayparts)
+
+    @property
+    def total_admin_fee(self) -> float:
+        return sum(d.admin_fee for d in self.dayparts)
+
+    @property
+    def total_revenue(self) -> float:
+        """Total = Net + Tax + Tips (matches Toast Revenue Summary)."""
+        return self.total_net + self.total_tax + self.total_tips
+
+
+def _safe_float(val) -> float:
+    """Convert a value to float, returning 0.0 on failure."""
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def compute_daily_sales(export_dir: Path, date_folder: str) -> DailySalesSummary | None:
+    """
+    Compute a daily sales summary from PaymentDetails.csv + CheckDetails.csv.
+
+    Uses PaymentDetails for daypart (Service column) and amounts, and
+    CheckDetails for per-check Tax and Discount. Excludes VOIDED payments.
+    """
+    day_dir = export_dir / date_folder
+    pay_file = day_dir / "PaymentDetails.csv"
+    check_file = day_dir / "CheckDetails.csv"
+
+    if not pay_file.exists() or not check_file.exists():
+        return None
+
+    # ── 1. Build tax & discount lookup from CheckDetails ───────────────
+    check_tax: dict[str, float] = {}
+    check_disc: dict[str, float] = {}
+    check_guests: dict[str, int] = {}
+    with open(check_file, newline="", encoding="utf-8-sig") as f:
+        for row in csv.DictReader(f):
+            chk = (row.get("Check #") or "").strip()
+            if chk:
+                check_tax[chk] = _safe_float(row.get("Tax"))
+                check_disc[chk] = _safe_float(row.get("Discount"))
+                ts = (row.get("Table Size") or "").strip()
+                if ts:
+                    check_guests[chk] = int(_safe_float(ts))
+
+    # ── 2. Aggregate by daypart from PaymentDetails ────────────────────
+    daypart_data: dict[str, dict] = {}
+    seen_checks_per_daypart: dict[str, set] = {}
+    void_amount = 0.0
+    void_count = 0
+    all_checks: set[str] = set()
+
+    with open(pay_file, newline="", encoding="utf-8-sig") as f:
+        for row in csv.DictReader(f):
+            status = (row.get("Status") or "").strip()
+            chk = (row.get("Check #") or "").strip()
+
+            # Count voids
+            if status == "VOIDED":
+                void_amount += _safe_float(row.get("Amount"))
+                void_count += 1
+                continue
+
+            # Only count CAPTURED payments (skip DENIED, etc.)
+            if status != "CAPTURED":
+                continue
+
+            svc = (row.get("Service") or "").strip() or "Other"
+            # Combine Late Night into Dinner
+            if svc == "Late Night":
+                svc = "Dinner"
+            amt = _safe_float(row.get("Amount"))
+            tip = _safe_float(row.get("Tip"))
+            grat = _safe_float(row.get("Gratuity"))
+            fee = _safe_float(row.get("V/MC/D Fees"))
+            # Subtract any refund from the amount
+            refund_amt = _safe_float(row.get("Refund Amount"))
+            amt -= refund_amt
+
+            if svc not in daypart_data:
+                daypart_data[svc] = {"amt": 0.0, "tip": 0.0,
+                                     "tax": 0.0, "disc": 0.0, "fee": 0.0}
+                seen_checks_per_daypart[svc] = set()
+
+            daypart_data[svc]["amt"] += amt
+            daypart_data[svc]["tip"] += tip + grat  # gratuity counts as tips
+            daypart_data[svc]["fee"] += fee
+
+            # Only count tax/discount once per check per daypart
+            if chk and chk not in seen_checks_per_daypart[svc]:
+                seen_checks_per_daypart[svc].add(chk)
+                daypart_data[svc]["tax"] += check_tax.get(chk, 0.0)
+                daypart_data[svc]["disc"] += check_disc.get(chk, 0.0)
+                all_checks.add(chk)
+
+    # ── 3. Build DaypartSales objects ──────────────────────────────────
+    # Custom sort order: Breakfast, Brunch, Lunch, Dinner, then others
+    order_map = {"Breakfast": 0, "Brunch": 1, "Lunch": 2, "Dinner": 3}
+    dayparts = []
+    for svc in sorted(daypart_data, key=lambda s: (order_map.get(s, 99), s)):
+        d = daypart_data[svc]
+        net = d["amt"] - d["tax"]
+        gross = net + d["disc"]
+        n_orders = len(seen_checks_per_daypart.get(svc, set()))
+        dayparts.append(DaypartSales(
+            name=svc,
+            orders=n_orders,
+            gross_sales=round(gross, 2),
+            net_sales=round(net, 2),
+            discount=round(d["disc"], 2),
+            tax=round(d["tax"], 2),
+            tips=round(d["tip"], 2),
+            admin_fee=round(d["fee"], 2),
+        ))
+
+    total_guests = sum(check_guests.get(c, 0) for c in all_checks)
+
+    return DailySalesSummary(
+        date_folder=date_folder,
+        dayparts=dayparts,
+        void_amount=round(void_amount, 2),
+        void_count=void_count,
+        total_orders=len(all_checks),
+        total_guests=total_guests,
+    )
+
+
 def generate_receipt_pdf(receipt: RoomChargeReceipt, out_path: Path):
     """Render a single room-charge receipt as a professional PDF."""
     w, h = letter  # 612 x 792 points
@@ -250,7 +438,7 @@ def generate_receipt_pdf(receipt: RoomChargeReceipt, out_path: Path):
     # ── Header ───────────────────────────────────────────────────────────
     c.setFont("Helvetica-Bold", 18)
     c.setFillColorRGB(0.106, 0.165, 0.290)  # BG_NAV #1B2A4A
-    c.drawString(left, y, "ANEMI")
+    c.drawString(left, y, "Sales-ANEMI")
     y -= 18
     c.setFont("Helvetica", 10)
     c.setFillColorRGB(0.420, 0.443, 0.502)  # FG_SEC #6B7280
@@ -421,7 +609,7 @@ def generate_combined_pdf(receipts: list[RoomChargeReceipt], out_path: Path):
     # Header
     c.setFont("Helvetica-Bold", 22)
     c.setFillColorRGB(0.106, 0.165, 0.290)
-    c.drawString(left, y, "ANEMI")
+    c.drawString(left, y, "Sales-ANEMI")
     y -= 18
     c.setFont("Helvetica", 10)
     c.setFillColorRGB(0.420, 0.443, 0.502)
@@ -589,7 +777,7 @@ def generate_combined_pdf(receipts: list[RoomChargeReceipt], out_path: Path):
         # Header
         c.setFont("Helvetica-Bold", 18)
         c.setFillColorRGB(0.106, 0.165, 0.290)
-        c.drawString(left, y, "ANEMI")
+        c.drawString(left, y, "Sales-ANEMI")
         y -= 18
         c.setFont("Helvetica", 10)
         c.setFillColorRGB(0.420, 0.443, 0.502)
@@ -792,7 +980,7 @@ def generate_all_receipts(export_dir: Path, log_fn=None) -> tuple[int, Path]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  SFTP CONFIGURATION — ANEMI Data Exports
+#  SFTP CONFIGURATION — Sales-ANEMI Data Exports
 # ═══════════════════════════════════════════════════════════════════════════════
 SFTP_HOST       = "s-9b0f88558b264dfda.server.transfer.us-east-1.amazonaws.com"
 SFTP_PORT       = 22
@@ -862,10 +1050,13 @@ def _save_settings(data: dict):
 #  DESIGN SYSTEM — Stamhad Payroll v1.2
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# ── Platform font ─────────────────────────────────────────────────────────────
+# ── Platform detection ─────────────────────────────────────────────────────────
 IS_MAC = platform.system() == "Darwin"
+IS_WIN = platform.system() == "Windows"
 FONT = ("Helvetica Neue" if IS_MAC
         else ("Ubuntu" if platform.system() == "Linux" else "Segoe UI"))
+# Windows renders tkinter fonts ~1pt larger than macOS, so we compensate
+_SZ = (lambda s: s - 1) if IS_WIN else (lambda s: s)
 
 # ── Colour Palette ────────────────────────────────────────────────────────────
 BG_PAGE      = "#F0F2F5"
@@ -963,10 +1154,17 @@ class Btn(tk.Frame):
 class Inp(tk.Entry):
     """Styled input field with focus-highlight border."""
     def __init__(self, parent, **kw):
+        # On Windows, use "solid" relief + bd=1 for a crisper look
+        relief = "solid" if IS_WIN else "flat"
+        bd = 1 if IS_WIN else 0
+        ht = 0 if IS_WIN else 1
         super().__init__(parent, bg=BG_INPUT, fg=FG, insertbackground=FG,
-                         relief="flat", font=(FONT, 12), bd=0,
-                         highlightthickness=1, highlightbackground=BORDER,
+                         relief=relief, font=(FONT, _SZ(12)), bd=bd,
+                         highlightthickness=ht, highlightbackground=BORDER,
                          highlightcolor=BORDER_FOCUS, **kw)
+        if IS_WIN:
+            # Add internal padding so text isn't jammed against the border
+            self.config(borderwidth=1)
 
 
 class Card(tk.Frame):
@@ -993,6 +1191,18 @@ class Toast(tk.Toplevel):
         y = parent.winfo_rooty() + 56
         self.geometry(f"+{x}+{y}")
         self.after(ms, self.destroy)
+
+
+def _configure_ttk_styles():
+    """Apply platform-aware ttk styles — called once at startup."""
+    style = ttk.Style()
+    if IS_WIN:
+        try:
+            style.theme_use("vista")  # Best-looking Windows theme
+        except Exception:
+            pass
+    style.configure("TScrollbar", troughcolor="#1B2A4A", background="#3A5278",
+                    bordercolor="#1B2A4A", arrowcolor="#94A3B8")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1243,11 +1453,654 @@ class DayDetailView(tk.Frame):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  DAY SALES VIEW — Daypart breakdown, discounts, voids
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _parse_void_user(raw: str) -> str:
+    """Extract a readable name from Toast's Void User field.
+    Input:  'RestaurantUser [id=..., user email = foo@bar.com]'
+    Output: 'foo@bar.com'
+    """
+    import re
+    m = re.search(r"user email\s*=\s*([^\]]+)", raw)
+    if m:
+        email = m.group(1).strip()
+        # If it's a UUID-style placeholder, return just "Staff"
+        if "@example.com" in email:
+            return "Staff"
+        return email
+    return raw[:40] if raw else ""
+
+
+class DaySalesView(tk.Frame):
+    """Full-screen daily sales breakdown view (daypart table + voids/discounts)."""
+
+    _DAYPART_COLORS = {
+        "Breakfast": "#F59E0B",
+        "Brunch":    "#FB923C",
+        "Lunch":     "#38BDF8",
+        "Dinner":    "#818CF8",
+        "Other":     "#94A3B8",
+    }
+
+    def __init__(self, parent, summary: DailySalesSummary,
+                 receipts: list[RoomChargeReceipt] | None = None,
+                 on_back=None, **kw):
+        super().__init__(parent, bg=BG_NAV, **kw)
+        self._on_back = on_back
+        self._summary = summary
+
+        try:
+            dt = datetime.datetime.strptime(summary.date_folder, "%Y%m%d")
+            title = dt.strftime("%A, %B %d, %Y")
+        except ValueError:
+            title = summary.date_folder
+
+        # ── Top bar ──────────────────────────────────────────────────────
+        top = tk.Frame(self, bg=BG_NAV)
+        top.pack(fill="x", padx=24, pady=(16, 0))
+
+        back_lbl = tk.Label(
+            top, text="\u2190  Back", bg=BG_NAV, fg=NAV_INACTIVE,
+            font=(FONT, 12), cursor="hand2")
+        back_lbl.pack(side="left")
+        back_lbl.bind("<Enter>", lambda e: back_lbl.config(fg="#FFFFFF"))
+        back_lbl.bind("<Leave>", lambda e: back_lbl.config(fg=NAV_INACTIVE))
+        back_lbl.bind("<Button-1>", lambda e: self._go_back())
+
+        tk.Label(top, text=title, bg=BG_NAV, fg="#FFFFFF",
+                 font=(FONT, 18, "bold")).pack(side="left", padx=(16, 0))
+
+        tk.Label(top, text="Daily Sales Summary", bg=BG_NAV, fg=NAV_DATE,
+                 font=(FONT, 12)).pack(side="right")
+
+        # ── Compute Manager Comp total from CheckDetails ──────────────────
+        mgr_comp_total = 0.0
+        try:
+            _out = Path(self.winfo_toplevel()._settings.get(
+                "output_folder", str(SFTP_DEFAULT_OUT)))
+            _chk = _out / summary.date_folder / "CheckDetails.csv"
+            if _chk.exists():
+                with open(_chk, newline="", encoding="utf-8-sig") as _f:
+                    for _row in csv.DictReader(_f):
+                        _reason = (_row.get("Reason of Discount") or "").strip()
+                        if "Manager Comp" in _reason:
+                            mgr_comp_total += _safe_float(_row.get("Discount"))
+        except Exception:
+            pass
+
+        # ── Grand totals bar ─────────────────────────────────────────────
+        totals_bar = tk.Frame(self, bg="#0F1D36")
+        totals_bar.pack(fill="x", padx=24, pady=(12, 0))
+
+        total_sales = summary.total_net + summary.total_tax
+        stats = [
+            ("Total Sales",   f"${total_sales:,.2f}",          "#6EE7B7"),
+            ("Net Sales",     f"${summary.total_net:,.2f}",    "#38BDF8"),
+            ("Tax",           f"${summary.total_tax:,.2f}",    "#FFD580"),
+            ("Manager Comp",  f"${mgr_comp_total:,.2f}",      "#F87171"),
+        ]
+        for label, value, color in stats:
+            cell = tk.Frame(totals_bar, bg="#0F1D36")
+            cell.pack(side="left", expand=True, fill="x", padx=8, pady=10)
+            tk.Label(cell, text=label, bg="#0F1D36", fg=NAV_INACTIVE,
+                     font=(FONT, 9)).pack()
+            tk.Label(cell, text=value, bg="#0F1D36", fg=color,
+                     font=(FONT, 16, "bold")).pack()
+
+        # ── Info row: orders, guests, voids badge ────────────────────────
+        info_bar = tk.Frame(self, bg=BG_NAV)
+        info_bar.pack(fill="x", padx=24, pady=(10, 0))
+
+        info_text = f"{summary.total_orders} orders"
+        if summary.total_guests > 0:
+            info_text += f"  \u00B7  {summary.total_guests} guests"
+        tk.Label(info_bar, text=info_text, bg=BG_NAV, fg=NAV_INACTIVE,
+                 font=(FONT, 11)).pack(side="left")
+
+        if summary.void_count > 0:
+            void_badge = tk.Label(
+                info_bar,
+                text=f"  {summary.void_count} void{'s' if summary.void_count != 1 else ''}  \u00B7  ${summary.void_amount:,.2f}  ",
+                bg="#3B1111", fg="#FCA5A5",
+                font=(FONT, 10, "bold"), padx=6, pady=2)
+            void_badge.pack(side="right")
+        else:
+            tk.Label(info_bar, text="No voids", bg=BG_NAV, fg="#6EE7B7",
+                     font=(FONT, 11)).pack(side="right")
+
+        # ── Scrollable content area ──────────────────────────────────────
+        content_frame = tk.Frame(self, bg=BG_NAV)
+        content_frame.pack(fill="both", expand=True, padx=0, pady=(8, 0))
+
+        canvas = tk.Canvas(content_frame, bg=BG_NAV, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(content_frame, orient="vertical",
+                                  command=canvas.yview)
+        scroll_inner = tk.Frame(canvas, bg=BG_NAV)
+
+        scroll_inner.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        cw_id = canvas.create_window((0, 0), window=scroll_inner, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        def _on_mousewheel(event):
+            if IS_MAC:
+                canvas.yview_scroll(int(-1 * event.delta), "units")
+            else:
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        canvas.bind_all("<Button-4>", lambda e: canvas.yview_scroll(-3, "units"))
+        canvas.bind_all("<Button-5>", lambda e: canvas.yview_scroll(3, "units"))
+        def _on_canvas_resize(e):
+            canvas.itemconfig(cw_id, width=e.width)
+        canvas.bind("<Configure>", _on_canvas_resize)
+
+        def _cleanup(e):
+            try:
+                canvas.unbind_all("<MouseWheel>")
+                canvas.unbind_all("<Button-4>")
+                canvas.unbind_all("<Button-5>")
+            except Exception:
+                pass
+        self.bind("<Destroy>", _cleanup)
+
+        inner = scroll_inner  # shorthand
+
+        # ── Daypart breakdown table ──────────────────────────────────────
+        self._build_daypart_table(inner, summary)
+
+        # ── Discounts section ────────────────────────────────────────────
+        self._build_discounts_section(inner, summary)
+
+        # ── Voids section ────────────────────────────────────────────────
+        self._build_voids_section(inner, summary)
+
+        # Padding
+        tk.Frame(inner, bg=BG_NAV, height=20).pack(fill="x")
+
+    # ── Daypart table ────────────────────────────────────────────────────
+    def _build_daypart_table(self, parent, summary: DailySalesSummary):
+        frame = tk.Frame(parent, bg=BG_NAV)
+        frame.pack(fill="x", padx=24, pady=(8, 0))
+
+        tk.Label(frame, text="Sales by Service Period", bg=BG_NAV,
+                 fg="#FFFFFF", font=(FONT, 13, "bold")).pack(anchor="w",
+                                                             pady=(0, 8))
+
+        hdr_bg = "#0F1D36"
+        hdr = tk.Frame(frame, bg=hdr_bg)
+        hdr.pack(fill="x")
+        for col in ["Service", "Orders", "Total Sales", "Net",
+                     "Discount", "Tax"]:
+            tk.Label(hdr, text=col, bg=hdr_bg, fg=NAV_INACTIVE,
+                     font=(FONT, 10, "bold"), padx=8,
+                     pady=8).pack(side="left", expand=True, fill="x")
+
+        tk.Frame(frame, bg="#2D4A7A", height=1).pack(fill="x")
+
+        for idx, dp in enumerate(summary.dayparts):
+            row_bg = "#162240" if idx % 2 == 0 else "#1A2B4D"
+            self._render_daypart_row(frame, dp, row_bg)
+
+        tk.Frame(frame, bg="#2D4A7A", height=2).pack(fill="x")
+
+        # Total row
+        tot = tk.Frame(frame, bg="#0F1D36")
+        tot.pack(fill="x")
+        wk_total_sales = summary.total_net + summary.total_tax
+        for val in ["Total", str(summary.total_orders),
+                     f"${wk_total_sales:,.2f}",
+                     f"${summary.total_net:,.2f}",
+                     f"${summary.total_discount:,.2f}",
+                     f"${summary.total_tax:,.2f}"]:
+            tk.Label(tot, text=val, bg="#0F1D36", fg="#FFFFFF",
+                     font=(FONT, 11, "bold"), padx=8,
+                     pady=10).pack(side="left", expand=True, fill="x")
+
+    def _render_daypart_row(self, parent, dp: DaypartSales, bg: str):
+        row = tk.Frame(parent, bg=bg)
+        row.pack(fill="x")
+
+        # Name with dot
+        nf = tk.Frame(row, bg=bg)
+        nf.pack(side="left", expand=True, fill="x")
+        dot_color = self._DAYPART_COLORS.get(dp.name, "#94A3B8")
+        tk.Label(nf, text="\u25CF", bg=bg, fg=dot_color,
+                 font=(FONT, 8), padx=4).pack(side="left")
+        tk.Label(nf, text=dp.name, bg=bg, fg="#FFFFFF",
+                 font=(FONT, 11), padx=4, pady=8).pack(side="left")
+
+        total_sales = dp.net_sales + dp.tax
+        vals = [str(dp.orders), f"${total_sales:,.2f}",
+                f"${dp.net_sales:,.2f}",
+                f"${dp.discount:,.2f}" if dp.discount > 0 else "\u2014",
+                f"${dp.tax:,.2f}"]
+        for v in vals:
+            fg = "#3A5278" if v == "\u2014" else "#B0C4DE"
+            tk.Label(row, text=v, bg=bg, fg=fg, font=(FONT, 11),
+                     padx=8, pady=8).pack(side="left", expand=True, fill="x")
+
+    # ── Discounts section ────────────────────────────────────────────────
+    def _build_discounts_section(self, parent, summary: DailySalesSummary):
+        try:
+            out_dir = Path(self.winfo_toplevel()._settings.get(
+                "output_folder", str(SFTP_DEFAULT_OUT)))
+            check_file = out_dir / summary.date_folder / "CheckDetails.csv"
+            if not check_file.exists():
+                return
+        except Exception:
+            return
+
+        disc_rows = []
+        with open(check_file, newline="", encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                disc = _safe_float(row.get("Discount"))
+                if disc > 0:
+                    disc_rows.append(row)
+
+        if not disc_rows:
+            return
+
+        # Separate Manager Comp from other discounts
+        comp_rows = []
+        other_rows = []
+        for row in disc_rows:
+            reason = (row.get("Reason of Discount") or "").strip()
+            if "Manager Comp" in reason:
+                comp_rows.append(row)
+            else:
+                other_rows.append(row)
+
+        frame = tk.Frame(parent, bg=BG_NAV)
+        frame.pack(fill="x", padx=24, pady=(20, 0))
+
+        # ── Manager Comp sub-section ──
+        if comp_rows:
+            comp_total = sum(_safe_float(r.get("Discount")) for r in comp_rows)
+            hdr_frame = tk.Frame(frame, bg=BG_NAV)
+            hdr_frame.pack(fill="x")
+            tk.Label(hdr_frame, text=f"Manager Comp ({len(comp_rows)})",
+                     bg=BG_NAV, fg="#F87171",
+                     font=(FONT, 13, "bold")).pack(side="left")
+            tk.Label(hdr_frame, text=f"${comp_total:,.2f}", bg=BG_NAV,
+                     fg="#F87171", font=(FONT, 13, "bold")).pack(side="right")
+            tk.Frame(frame, bg="#2D4A7A", height=1).pack(fill="x", pady=(4, 8))
+
+            for row in comp_rows:
+                self._render_discount_card(frame, row, is_comp=True)
+
+        # ── Other discounts sub-section ──
+        if other_rows:
+            other_total = sum(_safe_float(r.get("Discount")) for r in other_rows)
+            hdr_frame2 = tk.Frame(frame, bg=BG_NAV)
+            hdr_frame2.pack(fill="x", pady=(12 if comp_rows else 0, 0))
+            tk.Label(hdr_frame2, text=f"Other Discounts ({len(other_rows)})",
+                     bg=BG_NAV, fg="#FCD34D",
+                     font=(FONT, 13, "bold")).pack(side="left")
+            tk.Label(hdr_frame2, text=f"${other_total:,.2f}", bg=BG_NAV,
+                     fg="#FCD34D", font=(FONT, 13, "bold")).pack(side="right")
+            tk.Frame(frame, bg="#2D4A7A", height=1).pack(fill="x", pady=(4, 8))
+
+            for row in other_rows:
+                self._render_discount_card(frame, row, is_comp=False)
+
+    def _render_discount_card(self, parent, row: dict, is_comp: bool = False):
+        """Render a single discount card row."""
+        disc = _safe_float(row.get("Discount"))
+        reason = (row.get("Reason of Discount") or "").strip()
+        chk = (row.get("Check #") or "").strip()
+        server = (row.get("Server") or "").strip()
+        time_str = (row.get("Opened Time") or "").strip()
+
+        card_bg = "#2A1525" if is_comp else "#1E3358"
+        border_color = "#5B2D3D" if is_comp else "#2D4A7A"
+        amount_color = "#F87171" if is_comp else "#FCD34D"
+
+        card = tk.Frame(parent, bg=card_bg,
+                        highlightbackground=border_color,
+                        highlightthickness=1)
+        card.pack(fill="x", pady=3)
+
+        top_row = tk.Frame(card, bg=card_bg)
+        top_row.pack(fill="x", padx=12, pady=(8, 0))
+
+        tk.Label(top_row, text=f"Check #{chk}", bg=card_bg,
+                 fg="#FFFFFF", font=(FONT, 11, "bold")).pack(side="left")
+
+        if time_str:
+            tk.Label(top_row, text=time_str, bg=card_bg,
+                     fg=NAV_INACTIVE, font=(FONT, 10)).pack(
+                         side="left", padx=(10, 0))
+
+        tk.Label(top_row, text=f"${disc:,.2f}", bg=card_bg,
+                 fg=amount_color, font=(FONT, 12, "bold")).pack(side="right")
+
+        bot_row = tk.Frame(card, bg=card_bg)
+        bot_row.pack(fill="x", padx=12, pady=(2, 8))
+
+        if reason:
+            tk.Label(bot_row, text=reason, bg=card_bg,
+                     fg="#94A3B8", font=(FONT, 10)).pack(side="left")
+        if server:
+            tk.Label(bot_row, text=f"Server: {server}", bg=card_bg,
+                     fg="#5A7BA5", font=(FONT, 10)).pack(side="right")
+
+    # ── Voids section ────────────────────────────────────────────────────
+    def _build_voids_section(self, parent, summary: DailySalesSummary):
+        try:
+            out_dir = Path(self.winfo_toplevel()._settings.get(
+                "output_folder", str(SFTP_DEFAULT_OUT)))
+            pay_file = out_dir / summary.date_folder / "PaymentDetails.csv"
+            if not pay_file.exists():
+                return
+        except Exception:
+            return
+
+        void_rows = []
+        with open(pay_file, newline="", encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                if (row.get("Status") or "").strip() == "VOIDED":
+                    void_rows.append(row)
+
+        if not void_rows:
+            return
+
+        frame = tk.Frame(parent, bg=BG_NAV)
+        frame.pack(fill="x", padx=24, pady=(20, 0))
+
+        tk.Label(frame, text="Voided Payments", bg=BG_NAV,
+                 fg="#FCA5A5", font=(FONT, 13, "bold")).pack(anchor="w")
+        tk.Frame(frame, bg="#2D4A7A", height=1).pack(fill="x", pady=(4, 8))
+
+        for row in void_rows:
+            chk = (row.get("Check #") or "").strip()
+            amt = _safe_float(row.get("Amount"))
+            server = (row.get("Server") or "").strip()
+            card_type = (row.get("Card Type") or "").strip()
+            last4 = (row.get("Last 4 Card Digits") or "").strip()
+            void_date = (row.get("Void Date") or "").strip()
+            void_user_raw = (row.get("Void User") or "").strip()
+            void_approver_raw = (row.get("Void Approver") or "").strip()
+            table = (row.get("Table") or "").strip()
+            dining = (row.get("Dining Area") or "").strip()
+
+            void_by = _parse_void_user(void_user_raw)
+            approved_by = _parse_void_user(void_approver_raw)
+
+            card = tk.Frame(frame, bg="#2A1520",
+                            highlightbackground="#4A2030",
+                            highlightthickness=1)
+            card.pack(fill="x", pady=3)
+
+            # Row 1: check, card info, amount
+            r1 = tk.Frame(card, bg="#2A1520")
+            r1.pack(fill="x", padx=12, pady=(8, 0))
+
+            tk.Label(r1, text=f"Check #{chk}", bg="#2A1520",
+                     fg="#FFFFFF", font=(FONT, 11, "bold")).pack(side="left")
+
+            if card_type:
+                card_info = card_type
+                if last4:
+                    card_info += f" ****{last4}"
+                tk.Label(r1, text=card_info, bg="#2A1520",
+                         fg="#7A6080", font=(FONT, 10)).pack(
+                             side="left", padx=(10, 0))
+
+            tk.Label(r1, text=f"${amt:,.2f}", bg="#2A1520",
+                     fg="#FCA5A5", font=(FONT, 12, "bold")).pack(side="right")
+
+            # Row 2: server, table, void time
+            r2 = tk.Frame(card, bg="#2A1520")
+            r2.pack(fill="x", padx=12, pady=(2, 0))
+
+            details = []
+            if server:
+                details.append(f"Server: {server}")
+            if table:
+                loc = f"Table {table}"
+                if dining:
+                    loc += f" ({dining})"
+                details.append(loc)
+            if details:
+                tk.Label(r2, text="  \u00B7  ".join(details), bg="#2A1520",
+                         fg="#7A6080", font=(FONT, 10)).pack(side="left")
+
+            if void_date:
+                tk.Label(r2, text=void_date, bg="#2A1520",
+                         fg="#7A6080", font=(FONT, 10)).pack(side="right")
+
+            # Row 3: voided by / approved by
+            r3 = tk.Frame(card, bg="#2A1520")
+            r3.pack(fill="x", padx=12, pady=(2, 8))
+
+            if void_by:
+                tk.Label(r3, text=f"Voided by: {void_by}", bg="#2A1520",
+                         fg="#7A6080", font=(FONT, 9)).pack(side="left")
+            if approved_by and approved_by != void_by:
+                tk.Label(r3, text=f"Approved by: {approved_by}",
+                         bg="#2A1520", fg="#7A6080",
+                         font=(FONT, 9)).pack(side="right")
+
+    def _go_back(self):
+        if self._on_back:
+            self._on_back()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  WEEKLY SALES EXPORT — PDF with daily daypart breakdowns + voids/discounts
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def export_weekly_sales_pdf(export_dir: Path, dates: list[str],
+                            out_path: Path) -> int:
+    """
+    Generate a styled PDF with weekly sales summaries.
+    Returns the number of days with data.
+    """
+    if not REPORTLAB_OK:
+        raise RuntimeError("reportlab is required for PDF export")
+
+    summaries: list[tuple[str, str, DailySalesSummary]] = []
+    for date_folder in dates:
+        summary = compute_daily_sales(export_dir, date_folder)
+        if not summary:
+            continue
+        try:
+            dt = datetime.datetime.strptime(date_folder, "%Y%m%d")
+            date_str = dt.strftime("%m/%d/%Y")
+            day_name = dt.strftime("%A")
+        except ValueError:
+            date_str = date_folder
+            day_name = ""
+        summaries.append((date_str, day_name, summary))
+
+    if not summaries:
+        return 0
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    w, h = letter
+    c = rl_canvas.Canvas(str(out_path), pagesize=letter)
+    left = 40
+    right = w - 40
+    cw = right - left
+
+    # Colors
+    navy = (0.106, 0.165, 0.290)
+    dark_bg = (0.059, 0.114, 0.212)
+    accent = (0.329, 0.431, 0.647)
+    white = (1, 1, 1)
+    light_gray = (0.7, 0.7, 0.7)
+    green = (0.196, 0.804, 0.459)
+    yellow = (0.988, 0.827, 0.302)
+    red = (0.988, 0.647, 0.647)
+    purple = (0.655, 0.545, 0.980)
+
+    def _hline(y_pos, weight=0.5):
+        c.setStrokeColorRGB(*accent)
+        c.setLineWidth(weight)
+        c.line(left, y_pos, right, y_pos)
+
+    def _new_page():
+        c.showPage()
+        return h - 50
+
+    # ── Week header ──────────────────────────────────────────────────────
+    y = h - 50
+    first_date = summaries[0][0]
+    last_date = summaries[-1][0]
+    c.setFont("Helvetica-Bold", 20)
+    c.setFillColorRGB(*navy)
+    c.drawString(left, y, "Sales-ANEMI")
+    c.setFont("Helvetica", 10)
+    c.setFillColorRGB(*light_gray)
+    c.drawRightString(right, y, f"Weekly Sales Report")
+    y -= 18
+    c.setFont("Helvetica", 11)
+    c.drawString(left, y, f"{first_date}  \u2013  {last_date}")
+    y -= 6
+    _hline(y, 1.5)
+    y -= 20
+
+    # ── Week totals ──────────────────────────────────────────────────────
+    wk_net = sum(s.total_net for _, _, s in summaries)
+    wk_gross = sum(s.total_gross for _, _, s in summaries)
+    wk_tax = sum(s.total_tax for _, _, s in summaries)
+    wk_disc = sum(s.total_discount for _, _, s in summaries)
+    wk_voids = sum(s.void_amount for _, _, s in summaries)
+    wk_void_cnt = sum(s.void_count for _, _, s in summaries)
+    wk_orders = sum(s.total_orders for _, _, s in summaries)
+    wk_total_sales = wk_net + wk_tax
+
+    # Revenue summary box
+    c.setFillColorRGB(0.04, 0.08, 0.16)
+    c.roundRect(left, y - 80, cw, 80, 6, fill=1, stroke=0)
+
+    box_labels = [
+        ("Total Sales", f"${wk_total_sales:,.2f}"),
+        ("Net Sales",   f"${wk_net:,.2f}"),
+        ("Tax",         f"${wk_tax:,.2f}"),
+        ("Discounts",   f"${wk_disc:,.2f}"),
+    ]
+    col_w = cw / len(box_labels)
+    for i, (lbl, val) in enumerate(box_labels):
+        cx = left + col_w * i + col_w / 2
+        c.setFont("Helvetica", 8)
+        c.setFillColorRGB(*light_gray)
+        c.drawCentredString(cx, y - 30, lbl)
+        c.setFont("Helvetica-Bold", 14)
+        c.setFillColorRGB(*white)
+        c.drawCentredString(cx, y - 50, val)
+    y -= 90
+
+    # Secondary stats line
+    c.setFont("Helvetica", 9)
+    c.setFillColorRGB(*light_gray)
+    stats_line = f"{wk_orders} orders"
+    if wk_void_cnt > 0:
+        stats_line += f"  |  Voids: {wk_void_cnt} (${wk_voids:,.2f})"
+    c.drawString(left + 4, y, stats_line)
+    y -= 24
+
+    # ── Daily breakdowns ─────────────────────────────────────────────────
+    cols = ["Service", "Orders", "Total Sales", "Net", "Disc", "Tax"]
+    col_xs = [left + 4]
+    data_start = left + 80
+    data_w = (right - 4 - data_start) / (len(cols) - 1)
+    for i in range(1, len(cols)):
+        col_xs.append(data_start + data_w * (i - 1) + data_w)
+
+    for day_idx, (date_str, day_name, summary) in enumerate(summaries):
+        needed = 24 + 16 * (len(summary.dayparts) + 1) + 40
+        if y - needed < 50:
+            y = _new_page()
+
+        # Day header
+        c.setFont("Helvetica-Bold", 12)
+        c.setFillColorRGB(*navy)
+        c.drawString(left, y, f"{day_name}, {date_str}")
+        day_total = summary.total_net + summary.total_tax
+        c.setFont("Helvetica-Bold", 10)
+        c.setFillColorRGB(0.0, 0.55, 0.3)
+        c.drawRightString(right, y, f"Total: ${day_total:,.2f}")
+        y -= 4
+        _hline(y, 0.8)
+        y -= 14
+
+        # Table header
+        c.setFont("Helvetica-Bold", 8)
+        c.setFillColorRGB(*light_gray)
+        for i, col in enumerate(cols):
+            if i == 0:
+                c.drawString(col_xs[0], y, col)
+            else:
+                c.drawRightString(col_xs[i], y, col)
+        y -= 2
+        _hline(y, 0.3)
+        y -= 12
+
+        # Daypart rows
+        for dp in summary.dayparts:
+            c.setFont("Helvetica", 9)
+            c.setFillColorRGB(*navy)
+            c.drawString(col_xs[0], y, dp.name)
+            dp_total_sales = dp.net_sales + dp.tax
+            vals = [str(dp.orders), f"${dp_total_sales:,.2f}",
+                    f"${dp.net_sales:,.2f}",
+                    f"${dp.discount:,.2f}" if dp.discount > 0 else "-",
+                    f"${dp.tax:,.2f}"]
+            for i, v in enumerate(vals):
+                if v == "-":
+                    c.setFillColorRGB(0.6, 0.6, 0.65)
+                else:
+                    c.setFillColorRGB(0.25, 0.30, 0.40)
+                c.drawRightString(col_xs[i + 1], y, v)
+            y -= 14
+
+        # Total row
+        _hline(y + 10, 0.5)
+        c.setFont("Helvetica-Bold", 9)
+        c.setFillColorRGB(*navy)
+        c.drawString(col_xs[0], y, "Total")
+        day_total_sales = summary.total_net + summary.total_tax
+        tot_vals = [str(summary.total_orders),
+                    f"${day_total_sales:,.2f}",
+                    f"${summary.total_net:,.2f}",
+                    f"${summary.total_discount:,.2f}",
+                    f"${summary.total_tax:,.2f}"]
+        c.setFillColorRGB(0.2, 0.25, 0.35)
+        for i, v in enumerate(tot_vals):
+            c.drawRightString(col_xs[i + 1], y, v)
+        y -= 4
+
+        # Void line if any
+        if summary.void_count > 0:
+            y -= 10
+            c.setFont("Helvetica", 9)
+            c.setFillColorRGB(*red)
+            c.drawString(col_xs[0], y,
+                         f"Voids: {summary.void_count}  \u2014  ${summary.void_amount:,.2f}")
+            y -= 4
+
+        y -= 18  # spacing between days
+
+    # ── Footer ────────────────────────────────────────────────────────────
+    c.setFont("Helvetica", 7)
+    c.setFillColorRGB(*light_gray)
+    c.drawString(left, 30, f"Generated {datetime.datetime.now().strftime('%m/%d/%Y %I:%M %p')}  |  Sales-ANEMI")
+
+    c.save()
+    return len(summaries)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  LOGIN WINDOW — Email + Password (Firebase Auth)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 SUPPORT_EMAIL = "stamhadsoftware@gmail.com"
-LOGIN_APP_NAME = "ANEMI"
+LOGIN_APP_NAME = "Sales-ANEMI"
 
 class LoginWindow(tk.Tk):
     """
@@ -1257,9 +2110,18 @@ class LoginWindow(tk.Tk):
 
     def __init__(self, on_success, prefill_email=""):
         super().__init__()
-        self.title("ANEMI — Sign In")
+        self.title("Sales-ANEMI — Sign In")
         self.configure(bg=BG_PAGE)
-        self.geometry("440x540")
+        _lw, _lh = (440, 560) if IS_WIN else (440, 540)
+        self.geometry(f"{_lw}x{_lh}")
+        try:
+            sx = self.winfo_screenwidth()
+            sy = self.winfo_screenheight()
+            x = max(0, (sx - _lw) // 2)
+            y = max(0, (sy - _lh) // 2 - 40)
+            self.geometry(f"{_lw}x{_lh}+{x}+{y}")
+        except Exception:
+            pass
         self.resizable(False, False)
         self._on_success = on_success
         self._prefill_email = prefill_email
@@ -1273,7 +2135,8 @@ class LoginWindow(tk.Tk):
     def _build_ui(self):
         card = tk.Frame(self, bg=BG_CARD, highlightbackground=BORDER,
                          highlightthickness=1)
-        card.place(relx=0.5, rely=0.5, anchor="center", width=380, height=460)
+        _card_h = 480 if IS_WIN else 460
+        card.place(relx=0.5, rely=0.5, anchor="center", width=380, height=_card_h)
 
         # ── Branding header ─────────────────────────────────────────────
         tk.Label(card, text=LOGIN_APP_NAME, bg=BG_CARD, fg=BG_NAV,
@@ -1287,27 +2150,29 @@ class LoginWindow(tk.Tk):
         # Email
         tk.Label(card, text="Email", bg=BG_CARD, fg=FG,
                  font=(FONT, 11, "bold"), anchor="w").pack(fill="x", padx=40)
-        self.email_entry = tk.Entry(card, font=(FONT, 13), width=24,
-                                     highlightthickness=2, highlightcolor=ACCENT,
-                                     highlightbackground=BORDER, relief="flat",
-                                     bg="#F9FAFB")
-        self.email_entry.pack(fill="x", padx=40, pady=(4, 14))
+        _entry_kw = dict(font=(FONT, _SZ(13)), width=24, bg="#F9FAFB")
+        if IS_WIN:
+            _entry_kw.update(relief="solid", bd=1, highlightthickness=0)
+        else:
+            _entry_kw.update(relief="flat", highlightthickness=2,
+                             highlightcolor=ACCENT, highlightbackground=BORDER)
+        self.email_entry = tk.Entry(card, **_entry_kw)
+        self.email_entry.pack(fill="x", padx=40, pady=(4, 14), ipady=3 if IS_WIN else 0)
 
         # Password
         tk.Label(card, text="Password", bg=BG_CARD, fg=FG,
-                 font=(FONT, 11, "bold"), anchor="w").pack(fill="x", padx=40)
-        self.pw_entry = tk.Entry(card, font=(FONT, 13), width=24, show="\u2022",
-                                  highlightthickness=2, highlightcolor=ACCENT,
-                                  highlightbackground=BORDER, relief="flat",
-                                  bg="#F9FAFB")
-        self.pw_entry.pack(fill="x", padx=40, pady=(4, 10))
+                 font=(FONT, _SZ(11), "bold"), anchor="w").pack(fill="x", padx=40)
+        self.pw_entry = tk.Entry(card, show="\u2022", **_entry_kw)
+        self.pw_entry.pack(fill="x", padx=40, pady=(4, 10), ipady=3 if IS_WIN else 0)
 
         # Remember me
         self.remember_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(card, text="Remember me",
-                        variable=self.remember_var, bg=BG_CARD, fg=FG,
-                        selectcolor="#F9FAFB", activebackground=BG_CARD,
-                        font=(FONT, 10)).pack(anchor="w", padx=38, pady=(0, 6))
+        _cb_kw = dict(text="Remember me", variable=self.remember_var,
+                      bg=BG_CARD, fg=FG, activebackground=BG_CARD,
+                      font=(FONT, _SZ(10)))
+        if not IS_WIN:
+            _cb_kw["selectcolor"] = "#F9FAFB"
+        tk.Checkbutton(card, **_cb_kw).pack(anchor="w", padx=38, pady=(0, 6))
 
         # Error label
         self.err_lbl = tk.Label(card, text="", bg=BG_CARD, fg=DANGER,
@@ -1336,7 +2201,7 @@ class LoginWindow(tk.Tk):
                  text=f"Forgot password? Contact {SUPPORT_EMAIL}",
                  bg=BG_CARD, fg=FG_SEC, font=(FONT, 9)).pack(pady=(2, 0))
 
-        tk.Label(self, text=f"ANEMI  \u00A9 2026  Stamhad Software",
+        tk.Label(self, text=f"Sales-ANEMI  \u00A9 2026  Stamhad Software",
                  bg=BG_PAGE, fg=FG_SEC, font=(FONT, 9)).pack(side="bottom", pady=12)
 
     def _btn_hover(self, entering):
@@ -1397,7 +2262,7 @@ class AutoLoginSplash(tk.Tk):
 
     def __init__(self, session, on_success, on_fail):
         super().__init__()
-        self.title("ANEMI")
+        self.title("Sales-ANEMI")
         self.configure(bg=BG_NAV)
         self.geometry("340x200")
         self.resizable(False, False)
@@ -1481,9 +2346,31 @@ class App(tk.Tk):
     def __init__(self, user_role="admin", user_email="", user_display_name="",
                  user_uid="", id_token=""):
         super().__init__()
-        self.title("ANEMI — Room Charge Importer")
+        self.title("Sales-ANEMI")
         self.configure(bg=BG_NAV)
         self.minsize(900, 560)
+        # Default window size and center on screen
+        win_w, win_h = 1040, 640
+        self.geometry(f"{win_w}x{win_h}")
+        try:
+            sx = self.winfo_screenwidth()
+            sy = self.winfo_screenheight()
+            x = max(0, (sx - win_w) // 2)
+            y = max(0, (sy - win_h) // 2 - 30)
+            self.geometry(f"{win_w}x{win_h}+{x}+{y}")
+        except Exception:
+            pass
+        # Windows-specific: use dark title bar on Win 11+
+        if IS_WIN:
+            try:
+                import ctypes
+                HWND = ctypes.windll.user32.GetForegroundWindow()
+                DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    HWND, DWMWA_USE_IMMERSIVE_DARK_MODE,
+                    ctypes.byref(ctypes.c_int(1)), ctypes.sizeof(ctypes.c_int))
+            except Exception:
+                pass
         _ensure_dirs()
 
         # Store user info BEFORE building UI (role affects visible elements)
@@ -1493,11 +2380,15 @@ class App(tk.Tk):
         self._user_uid = user_uid
         self._id_token = id_token
 
+        # Configure ttk styles for this platform
+        _configure_ttk_styles()
+
         # Load saved settings
         self._settings = _load_settings()
         self._running = False
         self._pulse_id = None
         self._last_receipts: list[RoomChargeReceipt] = []
+        self._sales_cache: dict[str, DailySalesSummary | None] = {}
 
         self._build_ui()
 
@@ -1519,10 +2410,8 @@ class App(tk.Tk):
         top_bar = tk.Frame(self._main, bg=BG_NAV)
         top_bar.pack(fill="x", padx=20, pady=(12, 0))
 
-        tk.Label(top_bar, text="ANEMI", bg=BG_NAV, fg="#FFFFFF",
+        tk.Label(top_bar, text="Sales-ANEMI", bg=BG_NAV, fg="#FFFFFF",
                  font=(FONT, 20, "bold")).pack(side="left")
-        tk.Label(top_bar, text="Room Charge Importer", bg=BG_NAV,
-                 fg=NAV_INACTIVE, font=(FONT, 11)).pack(side="left", padx=(10, 0))
 
         # User name + Sign out button (top right)
         user_display = getattr(self, "_user_display_name", "") or getattr(self, "_user_email", "")
@@ -1557,9 +2446,41 @@ class App(tk.Tk):
         settings_btn.bind("<Leave>", lambda e: settings_btn.config(fg=NAV_INACTIVE))
         settings_btn.bind("<Button-1>", lambda e: self._open_settings())
 
-        # ── Get Weekly Orders button + Export Last Month + status ──────
+        # ── Tab bar ────────────────────────────────────────────────────
+        is_viewer = self._user_role == "viewer"
+        self._current_tab = "room_charge" if is_viewer else "sales"
+        tab_bar = tk.Frame(self._main, bg=BG_NAV)
+        tab_bar.pack(fill="x", padx=20, pady=(10, 0))
+
+        TAB_ACTIVE_BG = "#2563EB"
+        TAB_INACTIVE_BG = "#1E3358"
+        self._TAB_ACTIVE_BG = TAB_ACTIVE_BG
+        self._TAB_INACTIVE_BG = TAB_INACTIVE_BG
+
+        self._tab_sales_btn = tk.Label(
+            tab_bar, text="  Sales  ",
+            bg=TAB_ACTIVE_BG if not is_viewer else TAB_INACTIVE_BG,
+            fg="#FFFFFF" if not is_viewer else NAV_INACTIVE,
+            font=(FONT, 11, "bold"), padx=20, pady=6, cursor="hand2")
+        # Viewers cannot access the Sales tab
+        if not is_viewer:
+            self._tab_sales_btn.pack(side="left")
+            self._tab_sales_btn.bind("<Button-1>",
+                                     lambda e: self._switch_tab("sales"))
+
+        self._tab_rc_btn = tk.Label(
+            tab_bar, text="  Room Charge  ",
+            bg=TAB_ACTIVE_BG if is_viewer else TAB_INACTIVE_BG,
+            fg="#FFFFFF" if is_viewer else NAV_INACTIVE,
+            font=(FONT, 11, "bold"), padx=20, pady=6, cursor="hand2")
+        self._tab_rc_btn.pack(side="left", padx=(2 if not is_viewer else 0, 0))
+        self._tab_rc_btn.bind("<Button-1>",
+                              lambda e: self._switch_tab("room_charge"))
+
+        # ── Action bar ─────────────────────────────────────────────────
         action_bar = tk.Frame(self._main, bg=BG_NAV)
-        action_bar.pack(fill="x", padx=20, pady=(12, 0))
+        action_bar.pack(fill="x", padx=20, pady=(10, 0))
+        self._action_bar = action_bar
 
         # Only show fetch button for admin role
         is_admin = getattr(self, "_user_role", "admin") == "admin"
@@ -1579,11 +2500,10 @@ class App(tk.Tk):
             w.bind("<Leave>", self._start_hover_out)
             w.bind("<Button-1>", lambda e: self._on_start())
 
-        # Export This Month PDF button
+        # Export This Month PDF button (Room Charge tab)
         self._export_this_frame = tk.Frame(action_bar, bg=ACCENT,
                                            highlightbackground=ACCENT,
                                            highlightthickness=1, cursor="hand2")
-        self._export_this_frame.pack(side="left", padx=(10, 0))
         self._export_this_lbl = tk.Label(
             self._export_this_frame, text="Export This Month", bg=ACCENT,
             fg="#FFFFFF", font=(FONT, 11, "bold"), padx=16, pady=8,
@@ -1598,11 +2518,10 @@ class App(tk.Tk):
                 self._export_this_lbl.config(bg=ACCENT)))
             w.bind("<Button-1>", lambda e: self._export_month_pdf("this"))
 
-        # Export Last Month PDF button
+        # Export Last Month PDF button (Room Charge tab)
         self._export_frame = tk.Frame(action_bar, bg="#374151",
                                       highlightbackground="#374151",
                                       highlightthickness=1, cursor="hand2")
-        self._export_frame.pack(side="left", padx=(10, 0))
         self._export_lbl = tk.Label(
             self._export_frame, text="Export Last Month", bg="#374151",
             fg="#FFFFFF", font=(FONT, 11, "bold"), padx=16, pady=8,
@@ -1616,6 +2535,44 @@ class App(tk.Tk):
                 self._export_frame.config(bg="#374151", highlightbackground="#374151"),
                 self._export_lbl.config(bg="#374151")))
             w.bind("<Button-1>", lambda e: self._export_month_pdf("last"))
+
+        # Export Weekly Sales PDF button (Sales tab)
+        self._export_week_frame = tk.Frame(action_bar, bg="#5B21B6",
+                                           highlightbackground="#5B21B6",
+                                           highlightthickness=1, cursor="hand2")
+        self._export_week_frame.pack(side="left", padx=(10, 0))
+        self._export_week_lbl = tk.Label(
+            self._export_week_frame, text="Export Week Sales", bg="#5B21B6",
+            fg="#FFFFFF", font=(FONT, 11, "bold"), padx=16, pady=8,
+            cursor="hand2")
+        self._export_week_lbl.pack()
+        for w in (self._export_week_frame, self._export_week_lbl):
+            w.bind("<Enter>", lambda e: (
+                self._export_week_frame.config(bg="#6D28D9", highlightbackground="#6D28D9"),
+                self._export_week_lbl.config(bg="#6D28D9")))
+            w.bind("<Leave>", lambda e: (
+                self._export_week_frame.config(bg="#5B21B6", highlightbackground="#5B21B6"),
+                self._export_week_lbl.config(bg="#5B21B6")))
+            w.bind("<Button-1>", lambda e: self._export_weekly_sales())
+
+        # Export Last Week Sales PDF button (Sales tab)
+        self._export_lastweek_frame = tk.Frame(action_bar, bg="#374151",
+                                               highlightbackground="#374151",
+                                               highlightthickness=1, cursor="hand2")
+        self._export_lastweek_frame.pack(side="left", padx=(10, 0))
+        self._export_lastweek_lbl = tk.Label(
+            self._export_lastweek_frame, text="Export Last Week", bg="#374151",
+            fg="#FFFFFF", font=(FONT, 11, "bold"), padx=16, pady=8,
+            cursor="hand2")
+        self._export_lastweek_lbl.pack()
+        for w in (self._export_lastweek_frame, self._export_lastweek_lbl):
+            w.bind("<Enter>", lambda e: (
+                self._export_lastweek_frame.config(bg="#4B5563", highlightbackground="#4B5563"),
+                self._export_lastweek_lbl.config(bg="#4B5563")))
+            w.bind("<Leave>", lambda e: (
+                self._export_lastweek_frame.config(bg="#374151", highlightbackground="#374151"),
+                self._export_lastweek_lbl.config(bg="#374151")))
+            w.bind("<Button-1>", lambda e: self._export_weekly_sales(last_week=True))
 
         self._status_lbl = tk.Label(action_bar, text="", bg=BG_NAV,
                                     fg=NAV_INACTIVE, font=(FONT, 11))
@@ -1669,11 +2626,15 @@ class App(tk.Tk):
         for col, dt in enumerate(self._dates):
             self._build_day_card(col, dt)
 
+        # Show correct buttons for the default tab (sales)
+        self._update_tab_buttons()
+
         # ── Log area (hidden until running) ──────────────────────────────
         self._log_frame = tk.Frame(self._main, bg=BG_NAV)
 
+        _mono = "Consolas" if IS_WIN else "Courier"
         self._log = tk.Text(self._log_frame, bg="#0F1D36", fg="#A0CFFF",
-                            font=("Courier", 9), height=6, relief="flat",
+                            font=(_mono, 9), height=6, relief="flat",
                             bd=0, wrap="word", highlightthickness=1,
                             highlightbackground="#2D4A7A",
                             highlightcolor=ACCENT, state="disabled",
@@ -1684,7 +2645,7 @@ class App(tk.Tk):
         self._log.tag_configure("warn", foreground="#FCD34D")
         self._log.tag_configure("err", foreground="#FCA5A5")
         self._log.tag_configure("bold", foreground="#FFFFFF",
-                                font=("Courier", 9, "bold"))
+                                font=(_mono, 9, "bold"))
 
         # ── Footer ──────────────────────────────────────────────────────
         tk.Label(self._main, text="Stamhad Software", bg=BG_NAV,
@@ -1695,9 +2656,6 @@ class App(tk.Tk):
                         receipts: list[RoomChargeReceipt] | None = None):
         is_today = dt == datetime.date.today()
         card_bg = "#1E3A5F" if is_today else "#162240"
-        count = len(receipts) if receipts else 0
-        day_sales = sum(r.total for r in receipts) if receipts else 0
-        day_tips = sum(r.tip for r in receipts) if receipts else 0
 
         card = tk.Frame(self._cards_frame, bg=card_bg,
                         highlightbackground=ACCENT if is_today else "#2D4A7A",
@@ -1707,7 +2665,7 @@ class App(tk.Tk):
         day_name = self.DAY_NAMES[dt.weekday()]
         day_num = dt.strftime("%d")
 
-        # Day header
+        # Day header (shared between tabs)
         tk.Label(card, text=day_name, bg=card_bg,
                  fg="#FFFFFF" if is_today else NAV_INACTIVE,
                  font=(FONT, 11, "bold")).pack(pady=(10, 0))
@@ -1718,34 +2676,79 @@ class App(tk.Tk):
         sep = tk.Frame(card, bg="#2D4A7A", height=1)
         sep.pack(fill="x", padx=10, pady=(0, 6))
 
-        if count > 0:
-            # Charge type summary (e.g. "2 Room · 1 Hotel")
-            type_counts = Counter(r.charge_type for r in receipts)
-            type_parts = []
-            for ct, n in type_counts.most_common():
-                short = ct.replace(" Charge", "")  # "Room", "Hotel", "Voucher"
-                type_parts.append(f"{n} {short}")
-            tk.Label(card, text=" · ".join(type_parts),
-                     bg=card_bg, fg=NAV_INACTIVE,
-                     font=(FONT, 8)).pack(pady=(2, 0))
+        key = dt.strftime("%Y%m%d")
+        out_dir = self._settings.get("output_folder", str(SFTP_DEFAULT_OUT))
+        has_sales_data = (Path(out_dir) / key / "PaymentDetails.csv").exists()
+        clickable = False
 
-            tk.Label(card, text=f"${day_sales:,.2f}", bg=card_bg,
-                     fg="#6EE7B7", font=(FONT, 14, "bold")).pack(pady=(2, 0))
-            tk.Label(card, text="sales", bg=card_bg, fg=NAV_INACTIVE,
-                     font=(FONT, 8)).pack()
-            tk.Label(card, text=f"${day_tips:,.2f}", bg=card_bg,
-                     fg="#7EB8FF", font=(FONT, 12, "bold")).pack(pady=(4, 0))
-            tk.Label(card, text="tips", bg=card_bg, fg=NAV_INACTIVE,
-                     font=(FONT, 8)).pack(pady=(0, 10))
+        if self._current_tab == "sales":
+            # ── Sales tab card content ──
+            if has_sales_data:
+                summary = self._sales_cache.get(key)
+                if summary:
+                    total_sales = summary.total_net + summary.total_tax
+                    tk.Label(card, text=f"{summary.total_orders} orders",
+                             bg=card_bg, fg=NAV_INACTIVE,
+                             font=(FONT, 8)).pack(pady=(2, 0))
+                    tk.Label(card, text=f"${total_sales:,.2f}", bg=card_bg,
+                             fg="#6EE7B7", font=(FONT, 14, "bold")).pack(pady=(2, 0))
+                    tk.Label(card, text="total sales", bg=card_bg,
+                             fg=NAV_INACTIVE, font=(FONT, 8)).pack()
+                    tk.Label(card, text=f"${summary.total_net:,.2f}", bg=card_bg,
+                             fg="#38BDF8", font=(FONT, 12, "bold")).pack(pady=(2, 0))
+                    tk.Label(card, text="net sales", bg=card_bg,
+                             fg=NAV_INACTIVE, font=(FONT, 8)).pack()
+                    clickable = True
+                    for widget in [card] + list(card.winfo_children()):
+                        widget.config(cursor="hand2")
+                        widget.bind("<Button-1>",
+                                    lambda e, d=key, dr=receipts:
+                                        self._show_day_sales(d, dr))
+                else:
+                    tk.Label(card, text="No data", bg=card_bg, fg="#3A5278",
+                             font=(FONT, 9)).pack(pady=(4, 0))
+            else:
+                tk.Label(card, text="—", bg=card_bg, fg="#3A5278",
+                         font=(FONT, 14)).pack(expand=True)
+        else:
+            # ── Room Charge tab card content ──
+            count = len(receipts) if receipts else 0
+            day_sales = sum(r.total for r in receipts) if receipts else 0
+            day_tips = sum(r.tip for r in receipts) if receipts else 0
 
-            # Click to view day details
-            key = dt.strftime("%Y%m%d")
-            for widget in [card] + list(card.winfo_children()):
-                widget.config(cursor="hand2")
-                widget.bind("<Button-1>",
-                            lambda e, d=key, dr=receipts: self._show_day(d, dr))
+            if count > 0:
+                type_counts = Counter(r.charge_type for r in receipts)
+                type_parts = []
+                for ct, n in type_counts.most_common():
+                    short = ct.replace(" Charge", "")
+                    type_parts.append(f"{n} {short}")
+                tk.Label(card, text=" · ".join(type_parts),
+                         bg=card_bg, fg=NAV_INACTIVE,
+                         font=(FONT, 8)).pack(pady=(2, 0))
 
-            # Hover
+                tk.Label(card, text=f"${day_sales:,.2f}", bg=card_bg,
+                         fg="#6EE7B7", font=(FONT, 14, "bold")).pack(pady=(2, 0))
+                tk.Label(card, text="charges", bg=card_bg, fg=NAV_INACTIVE,
+                         font=(FONT, 8)).pack()
+                tk.Label(card, text=f"${day_tips:,.2f}", bg=card_bg,
+                         fg="#7EB8FF", font=(FONT, 12, "bold")).pack(pady=(2, 0))
+                tk.Label(card, text="tips", bg=card_bg, fg=NAV_INACTIVE,
+                         font=(FONT, 8)).pack()
+
+                clickable = True
+                for widget in [card] + list(card.winfo_children()):
+                    widget.config(cursor="hand2")
+                    widget.bind("<Button-1>",
+                                lambda e, d=key, dr=receipts: self._show_day(d, dr))
+            elif has_sales_data:
+                tk.Label(card, text="No charges", bg=card_bg, fg="#3A5278",
+                         font=(FONT, 9)).pack(pady=(4, 0))
+            else:
+                tk.Label(card, text="—", bg=card_bg, fg="#3A5278",
+                         font=(FONT, 14)).pack(expand=True)
+
+        # Hover effect
+        if clickable:
             def _hover_in(e, c=card, bg=card_bg):
                 lighter = "#264A72" if bg == "#1E3A5F" else "#1E3358"
                 c.config(bg=lighter)
@@ -1762,15 +2765,45 @@ class App(tk.Tk):
             for widget in [card] + list(card.winfo_children()):
                 widget.bind("<Enter>", _hover_in)
                 widget.bind("<Leave>", _hover_out)
-        else:
-            tk.Label(card, text="—", bg=card_bg, fg="#3A5278",
-                     font=(FONT, 14)).pack(expand=True)
 
         # Store reference
         if col < len(self._day_cards):
             self._day_cards[col] = {"frame": card, "dt": dt}
         else:
             self._day_cards.append({"frame": card, "dt": dt})
+
+    # ── Tab switching helpers ─────────────────────────────────────────────────
+    def _switch_tab(self, tab_name: str):
+        """Switch between 'sales' and 'room_charge' tabs."""
+        if tab_name == self._current_tab:
+            return
+        # Viewers can only access room_charge
+        if tab_name == "sales" and self._user_role == "viewer":
+            return
+        self._current_tab = tab_name
+        self._update_tab_buttons()
+        # Rebuild day cards for the new tab
+        receipts = getattr(self, "_last_receipts", [])
+        self._refresh_calendar(receipts)
+
+    def _update_tab_buttons(self):
+        """Update tab button styling and show/hide action buttons per tab."""
+        if self._current_tab == "sales":
+            self._tab_sales_btn.config(bg=self._TAB_ACTIVE_BG, fg="#FFFFFF")
+            self._tab_rc_btn.config(bg=self._TAB_INACTIVE_BG, fg=NAV_INACTIVE)
+            # Show Sales exports, hide Room Charge exports
+            self._export_week_frame.pack(side="left", padx=(10, 0))
+            self._export_lastweek_frame.pack(side="left", padx=(10, 0))
+            self._export_this_frame.pack_forget()
+            self._export_frame.pack_forget()
+        else:
+            self._tab_rc_btn.config(bg=self._TAB_ACTIVE_BG, fg="#FFFFFF")
+            self._tab_sales_btn.config(bg=self._TAB_INACTIVE_BG, fg=NAV_INACTIVE)
+            # Show Room Charge exports, hide Sales exports
+            self._export_week_frame.pack_forget()
+            self._export_lastweek_frame.pack_forget()
+            self._export_this_frame.pack(side="left", padx=(10, 0))
+            self._export_frame.pack(side="left", padx=(10, 0))
 
     # ── Week navigation helpers ──────────────────────────────────────────────
     def _update_week_label(self):
@@ -1812,6 +2845,14 @@ class App(tk.Tk):
         by_date: dict[str, list[RoomChargeReceipt]] = {}
         for r in receipts:
             by_date.setdefault(r.date_folder, []).append(r)
+
+        # Pre-compute sales data for the week (avoids per-card CSV reads)
+        out_dir = self._settings.get("output_folder", str(SFTP_DEFAULT_OUT))
+        self._sales_cache.clear()
+        for dt in self._dates:
+            key = dt.strftime("%Y%m%d")
+            if (Path(out_dir) / key / "PaymentDetails.csv").exists():
+                self._sales_cache[key] = compute_daily_sales(Path(out_dir), key)
 
         # Destroy old cards
         for child in self._cards_frame.winfo_children():
@@ -1890,6 +2931,24 @@ class App(tk.Tk):
             on_back=self._close_day_detail)
         self._detail.pack(fill="both", expand=True)
 
+    def _show_day_sales(self, date_key: str,
+                        receipts: list[RoomChargeReceipt] | None = None):
+        """Show the daily sales summary view for a given date."""
+        out_dir = self._settings.get("output_folder", str(SFTP_DEFAULT_OUT))
+        summary = compute_daily_sales(Path(out_dir), date_key)
+        if not summary:
+            messagebox.showinfo(
+                "No Sales Data",
+                f"No sales data available for {date_key}.\n\n"
+                "Make sure the data has been downloaded first.",
+                parent=self)
+            return
+        self._main.pack_forget()
+        self._detail = DaySalesView(
+            self, summary=summary, receipts=receipts,
+            on_back=self._close_day_detail)
+        self._detail.pack(fill="both", expand=True)
+
     def _close_day_detail(self):
         if hasattr(self, "_detail") and self._detail.winfo_exists():
             self._detail.pack_forget()
@@ -1907,37 +2966,115 @@ class App(tk.Tk):
         self._start_lbl.config(bg=bg)
 
     # ── First-run setup wizard ─────────────────────────────────────────────────
-    def _check_first_run_setup(self):
-        """If no SSH key is configured, prompt the admin to set one up."""
-        key_path = self._settings.get("ssh_key", str(SFTP_DEFAULT_KEY))
-        if Path(key_path).exists():
-            return  # Already set up
+    # ── SSH Key resolution (Firebase → local → browse → upload) ────────────
+    def _resolve_ssh_key(self, interactive: bool = True) -> str | None:
+        """
+        Resolve the SSH key in priority order:
+        1. Try loading from Firebase
+        2. Check local path (settings or default)
+        3. Check common fallback paths (e.g. ~/Desktop/toast/keys/)
+        4. If interactive, open file picker
+        5. Auto-upload to Firebase for future machines
 
-        answer = messagebox.askyesno(
-            "Welcome — First-Time Setup",
-            "No SSH key is configured for fetching data from Toast.\n\n"
-            "Would you like to select your SSH key file now?\n\n"
-            "(You can also do this later via the \u2699 Settings icon.)",
-            parent=self)
-        if not answer:
+        Returns the local file path to the key, or None if not found.
+        """
+        dest_path = str(_default_data_dir() / "keys" / "toast_rsa_key")
+
+        # ── 1. Try Firebase first ──────────────────────────────────────────
+        if AUTH_OK and self._id_token and self._user_uid:
+            try:
+                ok, result = auth.load_ssh_key_from_firebase(
+                    self._id_token, self._user_uid, dest_path)
+                if ok:
+                    self._settings["ssh_key"] = result
+                    _save_settings(self._settings)
+                    return result
+            except Exception:
+                pass
+
+        # ── 2. Check configured local path ─────────────────────────────────
+        local_key = self._settings.get("ssh_key", str(SFTP_DEFAULT_KEY))
+        if Path(local_key).exists():
+            # Auto-upload to Firebase if not there yet
+            self._maybe_upload_key_to_firebase(local_key)
+            return local_key
+
+        # ── 3. Check common fallback paths ─────────────────────────────────
+        fallback_paths = [
+            Path.home() / "Desktop" / "toast" / "keys" / "toast_rsa_key",
+            Path.home() / "Desktop" / "toast_rsa_key",
+            Path.home() / "Downloads" / "toast_rsa_key",
+            Path.home() / ".ssh" / "toast_rsa_key",
+        ]
+        for fp in fallback_paths:
+            if fp.exists():
+                # Copy to standard location
+                import shutil
+                dest = Path(dest_path)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(fp), str(dest))
+                if platform.system() != "Windows":
+                    dest.chmod(0o600)
+                self._settings["ssh_key"] = str(dest)
+                _save_settings(self._settings)
+                # Auto-upload to Firebase
+                self._maybe_upload_key_to_firebase(str(dest))
+                return str(dest)
+
+        # ── 4. Interactive: open file picker ───────────────────────────────
+        if not interactive:
+            return None
+
+        return None  # Caller handles the file picker flow
+
+    def _maybe_upload_key_to_firebase(self, key_path: str):
+        """Upload a local key to Firebase in a background thread (non-blocking)."""
+        if not AUTH_OK or not self._id_token or not self._user_uid:
             return
 
+        def _worker():
+            try:
+                if not auth.check_ssh_key_in_firebase(
+                        self._id_token, self._user_uid):
+                    auth.save_ssh_key_to_firebase(
+                        self._id_token, self._user_uid, key_path)
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _browse_and_install_key(self) -> str | None:
+        """Open a file picker, validate the key, copy locally, upload to Firebase."""
         key_file = filedialog.askopenfilename(
             title="Select your Toast SSH key file",
-            filetypes=[("All files", "*"), ("PEM files", "*.pem"),
-                       ("Key files", "*.key")],
+            filetypes=[("All files", "*"), ("All files", "*.*")],
             parent=self)
         if not key_file:
-            return
+            return None
 
-        # Copy the key to the app data directory
+        # Validate: check first line for PRIVATE KEY / BEGIN
+        try:
+            with open(key_file, "r", encoding="utf-8", errors="replace") as f:
+                first_line = f.readline().strip()
+            if "PRIVATE KEY" not in first_line and "BEGIN" not in first_line:
+                proceed = messagebox.askyesno(
+                    "Key Validation Warning",
+                    "This doesn't look like an SSH private key.\n\n"
+                    f"First line: {first_line[:60]}\n\n"
+                    "Upload anyway?",
+                    parent=self)
+                if not proceed:
+                    return None
+        except Exception:
+            pass  # Binary file or unreadable — still allow
+
+        # Copy to standard location
         import shutil
         dest_dir = _default_data_dir() / "keys"
         dest_dir.mkdir(parents=True, exist_ok=True)
-        dest_file = dest_dir / Path(key_file).name
+        dest_file = dest_dir / "toast_rsa_key"
         try:
-            shutil.copy2(key_file, dest_file)
-            # Fix permissions on macOS/Linux
+            shutil.copy2(key_file, str(dest_file))
             if platform.system() != "Windows":
                 dest_file.chmod(0o600)
         except Exception as exc:
@@ -1945,33 +3082,66 @@ class App(tk.Tk):
                 "Setup Error",
                 f"Could not copy key file:\n{exc}",
                 parent=self)
-            return
+            return None
 
-        # Save the path in settings
+        # Save to settings
         self._settings["ssh_key"] = str(dest_file)
         _save_settings(self._settings)
 
-        messagebox.showinfo(
-            "Setup Complete",
-            f"SSH key saved to:\n{dest_file}\n\n"
-            "You're all set! Click 'Get Weekly Orders' to fetch data.",
+        # Upload to Firebase
+        if AUTH_OK and self._id_token and self._user_uid:
+            ok, msg = auth.save_ssh_key_to_firebase(
+                self._id_token, self._user_uid, str(dest_file))
+            if ok:
+                Toast(self, "SSH key saved & synced to cloud!")
+            else:
+                Toast(self, "Key saved locally (cloud sync failed)",
+                      bg=WARN_BG, fg=WARN_FG)
+        else:
+            Toast(self, "SSH key saved locally!")
+
+        return str(dest_file)
+
+    def _check_first_run_setup(self):
+        """If no SSH key is available anywhere, prompt the admin to set one up."""
+        # Try resolving without user interaction first
+        resolved = self._resolve_ssh_key(interactive=False)
+        if resolved:
+            return  # Key found (either Firebase or local)
+
+        answer = messagebox.askyesno(
+            "Welcome — First-Time Setup",
+            "No SSH key was found for fetching data from Toast.\n\n"
+            "Would you like to select your SSH key file now?\n"
+            "It will be synced to your account so other computers "
+            "can use it automatically.\n\n"
+            "(You can also do this later via the \u2699 Settings icon.)",
             parent=self)
+        if not answer:
+            return
+
+        self._browse_and_install_key()
 
     # ── Start action ──────────────────────────────────────────────────────────
     def _on_start(self):
         if self._running:
             return
 
-        key_path = self._settings.get("ssh_key", str(SFTP_DEFAULT_KEY))
-        out_dir = self._settings.get("output_folder", str(SFTP_DEFAULT_OUT))
-
-        if not Path(key_path).exists():
-            messagebox.showerror(
-                "SSH Key Not Found",
-                f"SSH key file not found:\n{key_path}\n\n"
-                "Click the \u2699 gear icon to configure the correct path.",
+        # Resolve SSH key: Firebase → local → fallbacks → file picker
+        key_path = self._resolve_ssh_key(interactive=False)
+        if not key_path:
+            # No key found automatically — ask user to browse
+            answer = messagebox.askyesno(
+                "SSH Key Required",
+                "No SSH key found locally or in your cloud account.\n\n"
+                "Would you like to select your SSH key file now?",
                 parent=self)
-            return
+            if answer:
+                key_path = self._browse_and_install_key()
+            if not key_path:
+                return
+
+        out_dir = self._settings.get("output_folder", str(SFTP_DEFAULT_OUT))
 
         if not PARAMIKO_OK:
             messagebox.showerror(
@@ -2219,6 +3389,72 @@ class App(tk.Tk):
             self._pulse(msg)
         self.after(0, _do)
 
+    # ── Export Weekly Sales PDF ──────────────────────────────────────────────
+    def _export_weekly_sales(self, last_week: bool = False):
+        """Export a week's sales data to a PDF file.
+        If last_week=True, exports the week before the currently displayed one."""
+        if self._running:
+            return
+
+        if not REPORTLAB_OK:
+            messagebox.showerror("reportlab not installed",
+                                 "The 'reportlab' package is required.\n\n"
+                                 "Install it with:  pip install reportlab",
+                                 parent=self)
+            return
+
+        out_dir = self._settings.get("output_folder", str(SFTP_DEFAULT_OUT))
+        export_path = Path(out_dir)
+
+        # Determine the Monday for the target week
+        target_monday = self._current_monday
+        if last_week:
+            target_monday = self._current_monday - datetime.timedelta(weeks=1)
+
+        # Build date strings for the target week (Mon → Sun)
+        dates = [
+            (target_monday + datetime.timedelta(days=i)).strftime("%Y%m%d")
+            for i in range(7)
+        ]
+
+        week_start = target_monday.strftime("%m-%d")
+        week_end = (target_monday + datetime.timedelta(days=6)).strftime("%m-%d-%Y")
+        default_name = f"WeeklySales_{week_start}_to_{week_end}.pdf"
+
+        save_path = filedialog.asksaveasfilename(
+            title="Export Weekly Sales",
+            initialfile=default_name,
+            defaultextension=".pdf",
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+            parent=self)
+        if not save_path:
+            return
+
+        try:
+            count = export_weekly_sales_pdf(export_path, dates, Path(save_path))
+            if count == 0:
+                messagebox.showinfo(
+                    "No Data",
+                    "No sales data found for this week.\n\n"
+                    "Make sure you have downloaded the SFTP data first.",
+                    parent=self)
+            else:
+                Toast(self, f"Exported {count} day(s) of sales data!")
+                # Try to open the file
+                try:
+                    if IS_MAC:
+                        subprocess.Popen(["open", save_path])
+                    elif IS_WIN:
+                        os.startfile(save_path)
+                    else:
+                        subprocess.Popen(["xdg-open", save_path])
+                except Exception:
+                    pass
+        except Exception as exc:
+            messagebox.showerror("Export Error",
+                                 f"Failed to export weekly sales:\n{exc}",
+                                 parent=self)
+
     # ── Export Month PDF (this or last) ──────────────────────────────────────
     def _export_month_pdf(self, which: str = "this"):
         """
@@ -2413,7 +3649,7 @@ class App(tk.Tk):
 
 
 class SettingsDialog(tk.Toplevel):
-    """Modal settings window for SSH key and output folder."""
+    """Modal settings window with SSH key management and output folder."""
 
     def __init__(self, parent: App, settings: dict):
         super().__init__(parent)
@@ -2427,7 +3663,7 @@ class SettingsDialog(tk.Toplevel):
 
         # Center on parent
         self.update_idletasks()
-        w, h = 540, 340
+        w, h = 560, 440
         px = parent.winfo_rootx() + (parent.winfo_width() - w) // 2
         py = parent.winfo_rooty() + (parent.winfo_height() - h) // 2
         self.geometry(f"{w}x{h}+{px}+{py}")
@@ -2438,22 +3674,32 @@ class SettingsDialog(tk.Toplevel):
         tk.Label(body, text="Settings", bg=BG_PAGE, fg=FG,
                  font=(FONT, 18, "bold")).pack(anchor="w", pady=(0, 16))
 
-        # ── SSH Key ──────────────────────────────────────────────────────
+        # ── Toast SSH Key ────────────────────────────────────────────────
         card1 = Card(body)
         card1.pack(fill="x", pady=(0, 12))
-        tk.Label(card1, text="SSH Private Key", bg=BG_CARD, fg=FG,
-                 font=(FONT, 12, "bold")).pack(anchor="w")
-        tk.Label(card1, text="RSA key file for Toast SFTP authentication",
-                 bg=BG_CARD, fg=FG_SEC, font=(FONT, 10)).pack(anchor="w",
-                                                                pady=(0, 6))
-        row1 = tk.Frame(card1, bg=BG_CARD)
-        row1.pack(fill="x")
-        self._key_inp = Inp(row1)
-        self._key_inp.pack(side="left", fill="x", expand=True, ipady=4)
-        self._key_inp.insert(
-            0, settings.get("ssh_key", str(SFTP_DEFAULT_KEY)))
-        Btn(row1, text="Browse", style="ghost",
-            command=self._browse_key).pack(side="left", padx=(8, 0))
+
+        hdr_row = tk.Frame(card1, bg=BG_CARD)
+        hdr_row.pack(fill="x")
+        tk.Label(hdr_row, text="Toast SSH Key", bg=BG_CARD, fg=FG,
+                 font=(FONT, 12, "bold")).pack(side="left")
+        # Status badge (filled in by _refresh_key_status)
+        self._key_status_lbl = tk.Label(
+            hdr_row, text="  Checking...  ", bg="#E5E7EB", fg="#374151",
+            font=(FONT, 9, "bold"), padx=8, pady=2)
+        self._key_status_lbl.pack(side="right")
+
+        tk.Label(card1, text="RSA key for Toast SFTP — synced to your account",
+                 bg=BG_CARD, fg=FG_SEC, font=(FONT, 10)).pack(
+                     anchor="w", pady=(0, 8))
+
+        # Buttons row
+        key_btns = tk.Frame(card1, bg=BG_CARD)
+        key_btns.pack(fill="x")
+        Btn(key_btns, text="Browse & Upload Key", style="primary",
+            command=self._browse_and_upload).pack(side="left")
+        self._sync_btn = Btn(key_btns, text="Sync Local → Cloud",
+                             style="outline", command=self._sync_to_firebase)
+        self._sync_btn.pack(side="left", padx=(8, 0))
 
         # ── Output Folder ────────────────────────────────────────────────
         card2 = Card(body)
@@ -2472,7 +3718,7 @@ class SettingsDialog(tk.Toplevel):
         Btn(row2, text="Browse", style="ghost",
             command=self._browse_out).pack(side="left", padx=(8, 0))
 
-        # ── Buttons ──────────────────────────────────────────────────────
+        # ── Save / Cancel ────────────────────────────────────────────────
         btn_row = tk.Frame(body, bg=BG_PAGE)
         btn_row.pack(fill="x")
         Btn(btn_row, text="Save", style="primary",
@@ -2480,14 +3726,75 @@ class SettingsDialog(tk.Toplevel):
         Btn(btn_row, text="Cancel", style="ghost",
             command=self.destroy).pack(side="right", padx=(0, 8))
 
-    def _browse_key(self):
-        p = filedialog.askopenfilename(
-            title="Select SSH Private Key",
-            initialdir=str(Path.home() / "Downloads"),
-            filetypes=[("All files", "*.*"), ("PEM files", "*.pem")])
-        if p:
-            self._key_inp.delete(0, "end")
-            self._key_inp.insert(0, p)
+        # Check key status in background
+        self.after(100, self._refresh_key_status)
+
+    def _refresh_key_status(self):
+        """Determine SSH key status and update the badge."""
+        def _worker():
+            local_exists = Path(
+                self._settings.get("ssh_key", str(SFTP_DEFAULT_KEY))
+            ).exists()
+            cloud_exists = False
+            if (AUTH_OK and self._parent._id_token
+                    and self._parent._user_uid):
+                try:
+                    cloud_exists = auth.check_ssh_key_in_firebase(
+                        self._parent._id_token, self._parent._user_uid)
+                except Exception:
+                    pass
+            self.after(0, lambda: self._update_badge(local_exists, cloud_exists))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _update_badge(self, local_exists: bool, cloud_exists: bool):
+        self._local_exists = local_exists
+        self._cloud_exists = cloud_exists
+        if cloud_exists and local_exists:
+            self._key_status_lbl.config(
+                text="  Synced to Cloud  ", bg=SUCCESS_BG, fg=SUCCESS_FG)
+        elif local_exists and not cloud_exists:
+            self._key_status_lbl.config(
+                text="  Local Only  ", bg=WARN_BG, fg=WARN_FG)
+        elif cloud_exists and not local_exists:
+            self._key_status_lbl.config(
+                text="  In Cloud (not local)  ", bg="#DBEAFE", fg="#1E40AF")
+        else:
+            self._key_status_lbl.config(
+                text="  Not Configured  ", bg="#FEE2E2", fg="#991B1B")
+
+    def _browse_and_upload(self):
+        """Browse for key file, validate, copy locally, upload to Firebase."""
+        result = self._parent._browse_and_install_key()
+        if result:
+            self._refresh_key_status()
+
+    def _sync_to_firebase(self):
+        """Upload the existing local key to Firebase."""
+        local_key = self._settings.get("ssh_key", str(SFTP_DEFAULT_KEY))
+        if not Path(local_key).exists():
+            messagebox.showwarning(
+                "No Local Key",
+                "No local SSH key found to sync.\n"
+                "Use 'Browse & Upload Key' to select one first.",
+                parent=self)
+            return
+
+        if not AUTH_OK or not self._parent._id_token:
+            messagebox.showwarning(
+                "Not Signed In",
+                "You must be signed in to sync to the cloud.",
+                parent=self)
+            return
+
+        ok, msg = auth.save_ssh_key_to_firebase(
+            self._parent._id_token, self._parent._user_uid, local_key)
+        if ok:
+            Toast(self._parent, "SSH key synced to cloud!")
+            self._refresh_key_status()
+        else:
+            messagebox.showerror(
+                "Sync Failed", f"Could not upload key:\n{msg}", parent=self)
 
     def _browse_out(self):
         p = filedialog.askdirectory(
@@ -2498,7 +3805,6 @@ class SettingsDialog(tk.Toplevel):
             self._out_inp.insert(0, p)
 
     def _save(self):
-        self._settings["ssh_key"] = self._key_inp.get().strip()
         self._settings["output_folder"] = self._out_inp.get().strip()
         _save_settings(self._settings)
         self._parent._settings = self._settings

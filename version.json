@@ -1,10 +1,10 @@
 {
-  "latest_version": "1.0.7",
+  "latest_version": "1.2.0",
   "minimum_version": "1.0.0",
-  "release_date": "2026-03-23",
+  "release_date": "2026-03-26",
   "download_url_windows": "",
   "download_url_mac": "",
-  "release_notes": "Add Export This Month PDF button with Firebase support",
+  "release_notes": "Tabbed Sales/Room Charge interface, weekly sales PDF export, Manager Comp tracking, viewer role restrictions",
   "mandatory": false,
   "checksum_sha256": ""
 }

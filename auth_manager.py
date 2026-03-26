@@ -415,6 +415,100 @@ def _parse_firestore_value(val_obj) -> object:
     return str(val_obj)
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  FIREBASE — SSH Key Management (per-account cloud storage)
+# ═════════════════════════════════════════════════════════════════════════════
+
+import base64
+
+# Firebase Realtime Database base URL
+_RTDB_URL = f"https://{FIREBASE_PROJECT_ID}-default-rtdb.firebaseio.com"
+
+
+def save_ssh_key_to_firebase(id_token: str, uid: str,
+                              key_file_path: str) -> tuple[bool, str]:
+    """
+    Read an SSH private key file, base64-encode it, and store it in
+    Firebase Realtime Database at /restaurant_data/{uid}/settings/toast_ssh_key.
+
+    Returns (True, "OK") on success or (False, error_message) on failure.
+    """
+    try:
+        raw = Path(key_file_path).read_bytes()
+    except Exception as exc:
+        return False, f"Could not read key file: {exc}"
+
+    encoded = base64.b64encode(raw).decode("ascii")
+    url = (f"{_RTDB_URL}/restaurant_data/{uid}/settings/toast_ssh_key.json"
+           f"?auth={id_token}")
+
+    payload = json.dumps(encoded).encode("utf-8")
+    req = request.Request(
+        url, data=payload,
+        headers={"Content-Type": "application/json"},
+        method="PUT",
+    )
+    try:
+        with request.urlopen(req, timeout=15):
+            return True, "OK"
+    except error.HTTPError as e:
+        body = e.read().decode()
+        return False, f"HTTP {e.code}: {body[:200]}"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def load_ssh_key_from_firebase(id_token: str, uid: str,
+                                dest_path: str) -> tuple[bool, str]:
+    """
+    Download the SSH key from Firebase, decode it, write it to *dest_path*,
+    and set permissions to 600.
+
+    Returns (True, dest_path) on success or (False, error_message) on failure.
+    If no key is stored in Firebase, returns (False, "NO_KEY").
+    """
+    url = (f"{_RTDB_URL}/restaurant_data/{uid}/settings/toast_ssh_key.json"
+           f"?auth={id_token}")
+    req = request.Request(url, method="GET")
+    try:
+        with request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception as exc:
+        return False, str(exc)
+
+    if data is None or data == "null":
+        return False, "NO_KEY"
+
+    try:
+        raw = base64.b64decode(data)
+    except Exception as exc:
+        return False, f"Decode error: {exc}"
+
+    dest = Path(dest_path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        dest.write_bytes(raw)
+        # Set permissions to 600 (required by SSH/Paramiko)
+        if platform.system() != "Windows":
+            dest.chmod(0o600)
+        return True, str(dest)
+    except Exception as exc:
+        return False, f"Write error: {exc}"
+
+
+def check_ssh_key_in_firebase(id_token: str, uid: str) -> bool:
+    """Return True if an SSH key exists in Firebase for this account."""
+    url = (f"{_RTDB_URL}/restaurant_data/{uid}/settings/toast_ssh_key.json"
+           f"?auth={id_token}&shallow=true")
+    req = request.Request(url, method="GET")
+    try:
+        with request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+            return data is not None and data != "null"
+    except Exception:
+        return False
+
+
 def fetch_orders(id_token: str, date_folders: list[str] | None = None) -> list[dict]:
     """
     Fetch orders from Firestore.  If date_folders is given, only returns
