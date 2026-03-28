@@ -69,7 +69,7 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════════
 #  VERSION & UPDATE CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.3"
 GITHUB_USERNAME = "pipilas"
 GITHUB_REPO = "anemi-room-charge"
 
@@ -2826,16 +2826,14 @@ class App(tk.Tk):
         # Rebuild cards for the new week using existing local data
         out_dir = self._settings.get("output_folder", str(SFTP_DEFAULT_OUT))
         export_path = Path(out_dir)
+        local_receipts = []
         if export_path.exists():
             try:
-                all_receipts = find_room_charges(export_path)
-                if all_receipts:
-                    self._refresh_calendar(all_receipts)
-                    return
+                local_receipts = find_room_charges(export_path)
             except Exception:
                 pass
-        # Fall back to Firebase, or show empty cards
-        self._refresh_calendar([])
+        self._refresh_calendar(local_receipts)
+        # Always try Firebase to fill in missing data (sales + receipts)
         self._load_from_firebase()
 
     # ── Refresh all day cards with new receipt data ───────────────────────────
