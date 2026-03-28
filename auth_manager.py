@@ -544,3 +544,101 @@ def fetch_orders(id_token: str, date_folders: list[str] | None = None) -> list[d
         orders = [o for o in orders if o.get("date_folder") in date_set]
 
     return orders
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  FIRESTORE — Sales Summary Storage
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def upload_sales_summary(id_token: str, date_folder: str,
+                         summary_data: dict) -> tuple[bool, str]:
+    """
+    Upload a daily sales summary to Firestore at /sales/{date_folder}.
+
+    summary_data should contain:
+        date_folder, dayparts: [{name, orders, net_sales, tax, discount, gross_sales}],
+        void_amount, void_count, total_orders, total_guests
+    """
+    doc_id = date_folder
+    url = f"{_FIRESTORE_URL}/sales/{doc_id}"
+
+    fields = {}
+    for key, val in summary_data.items():
+        fields[key] = _to_firestore_value(val)
+
+    payload = json.dumps({"fields": fields}).encode("utf-8")
+
+    req = request.Request(
+        url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {id_token}",
+        },
+        method="PATCH",
+    )
+
+    try:
+        with request.urlopen(req, timeout=15):
+            return True, doc_id
+    except error.HTTPError as e:
+        body = e.read().decode()
+        return False, f"HTTP {e.code}: {body[:200]}"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def upload_sales_batch(id_token: str, summaries: list[dict],
+                       log_fn=None) -> tuple[int, int]:
+    """
+    Upload multiple daily sales summaries to Firestore.
+    Returns (success_count, error_count).
+    """
+    ok = 0
+    errs = 0
+    for s in summaries:
+        success, msg = upload_sales_summary(id_token, s["date_folder"], s)
+        if success:
+            ok += 1
+            if log_fn:
+                log_fn(f"[Firebase] Sales {s['date_folder']} → uploaded  ✓", "ok")
+        else:
+            errs += 1
+            if log_fn:
+                log_fn(f"[Firebase] Sales {s['date_folder']} — failed: {msg}", "err")
+    return ok, errs
+
+
+def fetch_sales(id_token: str,
+                date_folders: list[str] | None = None) -> list[dict]:
+    """
+    Fetch sales summaries from Firestore /sales collection.
+    If date_folders is given, filters to those dates only.
+    Returns a list of plain dicts.
+    """
+    url = f"{_FIRESTORE_URL}/sales?pageSize=500"
+
+    req = request.Request(
+        url,
+        headers={"Authorization": f"Bearer {id_token}"},
+        method="GET",
+    )
+
+    try:
+        with request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception:
+        return []
+
+    summaries = []
+    for doc in data.get("documents", []):
+        fields = doc.get("fields", {})
+        summary = {k: _parse_firestore_value(v) for k, v in fields.items()}
+        summaries.append(summary)
+
+    if date_folders:
+        date_set = set(date_folders)
+        summaries = [s for s in summaries
+                     if s.get("date_folder") in date_set]
+
+    return summaries

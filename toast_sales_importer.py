@@ -69,7 +69,7 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════════
 #  VERSION & UPDATE CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 GITHUB_USERNAME = "pipilas"
 GITHUB_REPO = "anemi-room-charge"
 
@@ -2678,7 +2678,8 @@ class App(tk.Tk):
 
         key = dt.strftime("%Y%m%d")
         out_dir = self._settings.get("output_folder", str(SFTP_DEFAULT_OUT))
-        has_sales_data = (Path(out_dir) / key / "PaymentDetails.csv").exists()
+        has_sales_data = ((Path(out_dir) / key / "PaymentDetails.csv").exists()
+                          or key in self._sales_cache)
         clickable = False
 
         if self._current_tab == "sales":
@@ -2847,12 +2848,17 @@ class App(tk.Tk):
             by_date.setdefault(r.date_folder, []).append(r)
 
         # Pre-compute sales data for the week (avoids per-card CSV reads)
+        # Preserve any Firebase-loaded entries that don't have local CSVs
         out_dir = self._settings.get("output_folder", str(SFTP_DEFAULT_OUT))
+        old_fb_cache = {k: v for k, v in self._sales_cache.items()}
         self._sales_cache.clear()
         for dt in self._dates:
             key = dt.strftime("%Y%m%d")
             if (Path(out_dir) / key / "PaymentDetails.csv").exists():
                 self._sales_cache[key] = compute_daily_sales(Path(out_dir), key)
+            elif key in old_fb_cache:
+                # Keep Firebase-loaded data for days without local CSVs
+                self._sales_cache[key] = old_fb_cache[key]
 
         # Destroy old cards
         for child in self._cards_frame.winfo_children():
@@ -2870,19 +2876,20 @@ class App(tk.Tk):
         """Load calendar data — tries local files first, then Firebase."""
         out_dir = self._settings.get("output_folder", str(SFTP_DEFAULT_OUT))
         export_path = Path(out_dir)
+        local_receipts = []
         if export_path.exists():
             try:
-                receipts = find_room_charges(export_path)
-                if receipts:
-                    self._refresh_calendar(receipts)
-                    return
+                local_receipts = find_room_charges(export_path)
             except Exception:
                 pass
-        # Fall back to Firebase
+
+        if local_receipts:
+            self._refresh_calendar(local_receipts)
+        # Always try Firebase to fill in missing data (sales + receipts)
         self._load_from_firebase()
 
     def _load_from_firebase(self):
-        """Fetch orders from Firestore and populate the calendar."""
+        """Fetch orders and sales from Firestore and populate the calendar."""
         if not AUTH_OK or not hasattr(self, "_id_token") or not self._id_token:
             return
 
@@ -2890,6 +2897,7 @@ class App(tk.Tk):
 
         def _worker():
             try:
+                # Fetch room charge orders
                 orders = auth.fetch_orders(self._id_token, date_keys)
                 receipts = []
                 for o in orders:
@@ -2916,8 +2924,53 @@ class App(tk.Tk):
                         charge_type=str(o.get("charge_type", "Room Charge")),
                         items=items,
                     ))
-                if receipts:
-                    self.after(0, lambda: self._refresh_calendar(receipts))
+
+                # Fetch sales summaries from Firebase
+                fb_sales = auth.fetch_sales(self._id_token, date_keys)
+                fb_sales_cache: dict[str, DailySalesSummary] = {}
+                for s in fb_sales:
+                    key = s.get("date_folder", "")
+                    if not key:
+                        continue
+                    dayparts = []
+                    for dp in s.get("dayparts", []):
+                        dayparts.append(DaypartSales(
+                            name=str(dp.get("name", "Other")),
+                            orders=int(dp.get("orders", 0)),
+                            net_sales=float(dp.get("net_sales", 0)),
+                            tax=float(dp.get("tax", 0)),
+                            discount=float(dp.get("discount", 0)),
+                            gross_sales=float(dp.get("gross_sales", 0)),
+                        ))
+                    fb_sales_cache[key] = DailySalesSummary(
+                        date_folder=key,
+                        dayparts=dayparts,
+                        void_amount=float(s.get("void_amount", 0)),
+                        void_count=int(s.get("void_count", 0)),
+                        total_orders=int(s.get("total_orders", 0)),
+                        total_guests=int(s.get("total_guests", 0)),
+                    )
+
+                def _apply():
+                    # Merge Firebase receipts with any existing local ones
+                    existing = getattr(self, "_last_receipts", [])
+                    existing_ids = {(r.date_folder, r.check_id) for r in existing}
+                    new_receipts = [r for r in receipts
+                                    if (r.date_folder, r.check_id)
+                                    not in existing_ids]
+                    merged = existing + new_receipts
+                    if merged or fb_sales_cache:
+                        # Merge Firebase sales into cache (only where local is missing)
+                        for key, summary in fb_sales_cache.items():
+                            if key not in self._sales_cache:
+                                self._sales_cache[key] = summary
+                        if merged:
+                            self._refresh_calendar(merged)
+                        elif fb_sales_cache:
+                            # No receipts changed but sales loaded — rebuild cards
+                            self._refresh_calendar(
+                                getattr(self, "_last_receipts", []))
+                self.after(0, _apply)
             except Exception:
                 pass
 
@@ -2936,6 +2989,9 @@ class App(tk.Tk):
         """Show the daily sales summary view for a given date."""
         out_dir = self._settings.get("output_folder", str(SFTP_DEFAULT_OUT))
         summary = compute_daily_sales(Path(out_dir), date_key)
+        # Fall back to Firebase-cached data if no local CSV
+        if not summary:
+            summary = self._sales_cache.get(date_key)
         if not summary:
             messagebox.showinfo(
                 "No Sales Data",
@@ -3316,6 +3372,40 @@ class App(tk.Tk):
                 self._log_safe(f"\nFirebase upload failed: {exc}", "err")
         elif AUTH_OK and all_receipts:
             self._log_safe("\nFirebase upload skipped — not logged in.", "warn")
+
+        # ── Phase 4: Upload sales summaries to Firebase ──────────────────
+        if AUTH_OK and hasattr(self, "_id_token") and self._id_token:
+            self._update_status("Uploading sales to Firebase")
+            self._log_safe("\nUploading sales summaries to Firebase...", "info")
+            sales_dicts = []
+            for dt in self._dates:
+                key = dt.strftime("%Y%m%d")
+                summary = compute_daily_sales(export_path, key)
+                if summary:
+                    sales_dicts.append({
+                        "date_folder": key,
+                        "dayparts": [
+                            {"name": dp.name, "orders": dp.orders,
+                             "net_sales": dp.net_sales, "tax": dp.tax,
+                             "discount": dp.discount,
+                             "gross_sales": dp.gross_sales}
+                            for dp in summary.dayparts
+                        ],
+                        "void_amount": summary.void_amount,
+                        "void_count": summary.void_count,
+                        "total_orders": summary.total_orders,
+                        "total_guests": summary.total_guests,
+                    })
+            if sales_dicts:
+                try:
+                    ok, errs = auth.upload_sales_batch(
+                        self._id_token, sales_dicts, log_fn=self._log_safe)
+                    self._log_safe(
+                        f"\nFirebase sales: {ok} uploaded, {errs} error(s).",
+                        "bold")
+                except Exception as exc:
+                    self._log_safe(
+                        f"\nFirebase sales upload failed: {exc}", "err")
 
         self._finish_pipeline(downloaded, receipt_count, all_receipts)
 
