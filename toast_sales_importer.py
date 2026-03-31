@@ -69,7 +69,7 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════════
 #  VERSION & UPDATE CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
-APP_VERSION = "1.2.4"
+APP_VERSION = "1.2.41"
 GITHUB_USERNAME = "pipilas"
 GITHUB_REPO = "anemi-room-charge"
 
@@ -3670,6 +3670,9 @@ class App(tk.Tk):
                                 f"No charge receipts found for {month_display}.",
                                 parent=self)
             return
+
+        # Sort by date, then by check number for consistent ordering
+        month_receipts.sort(key=lambda r: (r.date_folder, r.check_number))
 
         # Ask user where to save
         save_path = filedialog.asksaveasfilename(

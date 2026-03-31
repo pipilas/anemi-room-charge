@@ -80,6 +80,10 @@ class Updater:
         else:
             download_url = data.get("download_url_windows", data.get("download_url", ""))
 
+        # If no explicit URL, try GitHub Releases API for the latest tag
+        if not download_url and update_available:
+            download_url = self._find_release_asset(latest)
+
         return {
             "update_available": update_available,
             "latest_version": latest,
@@ -91,6 +95,33 @@ class Updater:
             "download_url": download_url,
             "checksum": data.get("checksum_sha256", ""),
         }
+
+    def _find_release_asset(self, version: str) -> str:
+        """
+        Query GitHub Releases API for the download URL of the .exe or .dmg
+        asset matching the given version tag (e.g. 'v1.2.4' or '1.2.4').
+        Returns the browser_download_url or empty string if not found.
+        """
+        # Try both 'v1.2.4' and '1.2.4' tag formats
+        tags_to_try = [f"v{version}", version]
+        ext = ".dmg" if IS_MAC else ".exe"
+
+        for tag in tags_to_try:
+            url = (f"https://api.github.com/repos/"
+                   f"{self.github_username}/{self.github_repo}/releases/tags/{tag}")
+            try:
+                req = urllib.request.Request(url, method="GET")
+                req.add_header("User-Agent", f"{self.app_name}-Updater")
+                req.add_header("Accept", "application/vnd.github.v3+json")
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    release = json.loads(resp.read().decode("utf-8"))
+                for asset in release.get("assets", []):
+                    name = asset.get("name", "").lower()
+                    if name.endswith(ext):
+                        return asset.get("browser_download_url", "")
+            except Exception:
+                continue
+        return ""
 
     def download_update(self, url, checksum="", progress_callback=None):
         """
