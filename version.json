@@ -1,10 +1,10 @@
 {
-  "latest_version": "1.2.3",
+  "latest_version": "1.2.4",
   "minimum_version": "1.0.0",
   "release_date": "2026-03-28",
   "download_url_windows": "",
   "download_url_mac": "",
-  "release_notes": "Bidirectional Firebase sync for sales + room charges, week navigation sync fix",
+  "release_notes": "Export merges Firebase + local receipts, weekly sales uses Firebase cache",
   "mandatory": false,
   "checksum_sha256": ""
 }

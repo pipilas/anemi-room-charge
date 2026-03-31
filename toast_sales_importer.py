@@ -69,7 +69,7 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════════
 #  VERSION & UPDATE CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
-APP_VERSION = "1.2.3"
+APP_VERSION = "1.2.4"
 GITHUB_USERNAME = "pipilas"
 GITHUB_REPO = "anemi-room-charge"
 
@@ -1895,10 +1895,12 @@ class DaySalesView(tk.Frame):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def export_weekly_sales_pdf(export_dir: Path, dates: list[str],
-                            out_path: Path) -> int:
+                            out_path: Path,
+                            sales_cache: dict | None = None) -> int:
     """
     Generate a styled PDF with weekly sales summaries.
     Returns the number of days with data.
+    sales_cache: optional dict of date_folder -> DailySalesSummary from Firebase.
     """
     if not REPORTLAB_OK:
         raise RuntimeError("reportlab is required for PDF export")
@@ -1906,6 +1908,9 @@ def export_weekly_sales_pdf(export_dir: Path, dates: list[str],
     summaries: list[tuple[str, str, DailySalesSummary]] = []
     for date_folder in dates:
         summary = compute_daily_sales(export_dir, date_folder)
+        # Fall back to Firebase-cached data if no local CSV
+        if not summary and sales_cache:
+            summary = sales_cache.get(date_folder)
         if not summary:
             continue
         try:
@@ -3519,7 +3524,8 @@ class App(tk.Tk):
             return
 
         try:
-            count = export_weekly_sales_pdf(export_path, dates, Path(save_path))
+            count = export_weekly_sales_pdf(export_path, dates, Path(save_path),
+                                              sales_cache=self._sales_cache)
             if count == 0:
                 messagebox.showinfo(
                     "No Data",
@@ -3613,8 +3619,8 @@ class App(tk.Tk):
             except Exception:
                 pass
 
-        # ── Fall back to Firebase if no local data ───────────────────────
-        if not month_receipts and AUTH_OK and hasattr(self, "_id_token") and self._id_token:
+        # ── Merge Firebase receipts (fill in any missing days/checks) ────
+        if AUTH_OK and hasattr(self, "_id_token") and self._id_token:
             try:
                 # Generate all date keys for the month range
                 date_keys = []
@@ -3623,8 +3629,16 @@ class App(tk.Tk):
                     date_keys.append(d.strftime("%Y%m%d"))
                     d += datetime.timedelta(days=1)
 
+                # Track existing local receipts by (date_folder, check_id)
+                existing_ids = {(r.date_folder, r.check_id)
+                                for r in month_receipts}
+
                 orders = auth.fetch_orders(self._id_token, date_keys)
                 for o in orders:
+                    df = str(o.get("date_folder", ""))
+                    cid = str(o.get("check_id", ""))
+                    if (df, cid) in existing_ids:
+                        continue  # already have this receipt locally
                     items = []
                     for it in o.get("items", []):
                         items.append(ReceiptItem(
@@ -3634,8 +3648,8 @@ class App(tk.Tk):
                             tax=float(it.get("tax", 0)),
                         ))
                     month_receipts.append(RoomChargeReceipt(
-                        date_folder=str(o.get("date_folder", "")),
-                        check_id=str(o.get("check_id", "")),
+                        date_folder=df,
+                        check_id=cid,
                         check_number=str(o.get("check_number", "")),
                         tab_name=str(o.get("tab_name", "")),
                         server=str(o.get("server", "")),
