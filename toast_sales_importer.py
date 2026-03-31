@@ -69,7 +69,7 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════════
 #  VERSION & UPDATE CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
-APP_VERSION = "1.2.41"
+APP_VERSION = "1.2.42"
 GITHUB_USERNAME = "pipilas"
 GITHUB_REPO = "anemi-room-charge"
 
@@ -2393,6 +2393,7 @@ class App(tk.Tk):
         self._running = False
         self._pulse_id = None
         self._last_receipts: list[RoomChargeReceipt] = []
+        self._all_receipts_cache: dict[str, dict[str, RoomChargeReceipt]] = {}
         self._sales_cache: dict[str, DailySalesSummary | None] = {}
 
         self._build_ui()
@@ -2846,22 +2847,29 @@ class App(tk.Tk):
         """Rebuild all 7 day cards with updated data."""
         self._last_receipts = receipts
 
-        by_date: dict[str, list[RoomChargeReceipt]] = {}
+        # Update persistent receipts cache (keyed by date_folder + check_id)
         for r in receipts:
-            by_date.setdefault(r.date_folder, []).append(r)
+            cache_key = r.date_folder
+            if cache_key not in self._all_receipts_cache:
+                self._all_receipts_cache[cache_key] = {}
+            self._all_receipts_cache[cache_key][(r.date_folder, r.check_id)] = r
 
-        # Pre-compute sales data for the week (avoids per-card CSV reads)
-        # Preserve any Firebase-loaded entries that don't have local CSVs
+        # Build by_date from persistent cache for current week's dates
+        by_date: dict[str, list[RoomChargeReceipt]] = {}
+        for dt in self._dates:
+            key = dt.strftime("%Y%m%d")
+            if key in self._all_receipts_cache:
+                by_date[key] = list(self._all_receipts_cache[key].values())
+
+        # Pre-compute sales data for the current week's dates only.
+        # Keep all other cached entries (from Firebase or other weeks) intact.
         out_dir = self._settings.get("output_folder", str(SFTP_DEFAULT_OUT))
-        old_fb_cache = {k: v for k, v in self._sales_cache.items()}
-        self._sales_cache.clear()
         for dt in self._dates:
             key = dt.strftime("%Y%m%d")
             if (Path(out_dir) / key / "PaymentDetails.csv").exists():
+                # Local CSV always wins — recompute from source
                 self._sales_cache[key] = compute_daily_sales(Path(out_dir), key)
-            elif key in old_fb_cache:
-                # Keep Firebase-loaded data for days without local CSVs
-                self._sales_cache[key] = old_fb_cache[key]
+            # Otherwise keep whatever is already cached (Firebase data)
 
         # Destroy old cards
         for child in self._cards_frame.winfo_children():
