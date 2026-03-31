@@ -35,7 +35,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: windows-exe
-          path: dist/AnemiRoomCharge.exe
+          path: dist/RoomChargeAndSales.exe
 
   # ── Build macOS DMG ──────────────────────────────────────────────────────
   build-mac:
@@ -64,9 +64,9 @@ jobs:
 
       - name: Create DMG
         run: |
-          APP_NAME="ANEMI Room Charge"
+          APP_NAME="Room Charge & Sales"
           VERSION=${{ steps.version.outputs.version }}
-          DMG_NAME="AnemiRoomCharge-${VERSION}-mac"
+          DMG_NAME="RoomChargeAndSales-${VERSION}-mac"
 
           mkdir -p dmg_temp
           cp -R "dist/${APP_NAME}.app" dmg_temp/
@@ -83,7 +83,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: macos-dmg
-          path: dist/AnemiRoomCharge-*-mac.dmg
+          path: dist/RoomChargeAndSales-*-mac.dmg
 
   # ── Create GitHub Release + Update version.json ─────────────────────────
   release:
@@ -136,16 +136,16 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: "v${{ steps.version.outputs.version }}"
           body: |
-            ## ANEMI Room Charge v${{ steps.version.outputs.version }}
+            ## Room Charge & Sales v${{ steps.version.outputs.version }}
 
             ${{ steps.notes.outputs.notes }}
 
             ### Downloads
-            - **Windows:** AnemiRoomCharge.exe
-            - **macOS:** AnemiRoomCharge-${{ steps.version.outputs.version }}-mac.dmg
+            - **Windows:** RoomChargeAndSales.exe
+            - **macOS:** RoomChargeAndSales-${{ steps.version.outputs.version }}-mac.dmg
           files: |
-            artifacts/AnemiRoomCharge.exe
-            artifacts/AnemiRoomCharge-*-mac.dmg
+            artifacts/RoomChargeAndSales.exe
+            artifacts/RoomChargeAndSales-*-mac.dmg
 
       # ── Update version.json AFTER release is created ───────────────
       - name: Update version.json with correct URLs
@@ -164,8 +164,8 @@ jobs:
           with open('version.json') as f:
               d = json.load(f)
           d['latest_version'] = version
-          d['download_url_windows'] = f'https://github.com/pipilas/anemi-room-charge/releases/download/v{version}/AnemiRoomCharge.exe'
-          d['download_url_mac'] = f'https://github.com/pipilas/anemi-room-charge/releases/download/v{version}/AnemiRoomCharge-{version}-mac.dmg'
+          d['download_url_windows'] = f'https://github.com/pipilas/anemi-room-charge/releases/download/v{version}/RoomChargeAndSales.exe'
+          d['download_url_mac'] = f'https://github.com/pipilas/anemi-room-charge/releases/download/v{version}/RoomChargeAndSales-{version}-mac.dmg'
           d['release_date'] = '$(date -I)'
           with open('version.json', 'w') as f:
               json.dump(d, f, indent=2)

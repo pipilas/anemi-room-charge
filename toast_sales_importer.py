@@ -69,7 +69,7 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════════
 #  VERSION & UPDATE CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
-APP_VERSION = "1.2.42"
+APP_VERSION = "1.2.5"
 GITHUB_USERNAME = "pipilas"
 GITHUB_REPO = "anemi-room-charge"
 
@@ -80,7 +80,7 @@ try:
         current_version=APP_VERSION,
         github_username=GITHUB_USERNAME,
         github_repo=GITHUB_REPO,
-        app_name="Sales-ANEMI",
+        app_name="Room Charge & Sales",
     )
     UPDATER_OK = True
 except Exception:
@@ -438,7 +438,7 @@ def generate_receipt_pdf(receipt: RoomChargeReceipt, out_path: Path):
     # ── Header ───────────────────────────────────────────────────────────
     c.setFont("Helvetica-Bold", 18)
     c.setFillColorRGB(0.106, 0.165, 0.290)  # BG_NAV #1B2A4A
-    c.drawString(left, y, "Sales-ANEMI")
+    c.drawString(left, y, "Room Charge & Sales")
     y -= 18
     c.setFont("Helvetica", 10)
     c.setFillColorRGB(0.420, 0.443, 0.502)  # FG_SEC #6B7280
@@ -609,7 +609,7 @@ def generate_combined_pdf(receipts: list[RoomChargeReceipt], out_path: Path):
     # Header
     c.setFont("Helvetica-Bold", 22)
     c.setFillColorRGB(0.106, 0.165, 0.290)
-    c.drawString(left, y, "Sales-ANEMI")
+    c.drawString(left, y, "Room Charge & Sales")
     y -= 18
     c.setFont("Helvetica", 10)
     c.setFillColorRGB(0.420, 0.443, 0.502)
@@ -777,7 +777,7 @@ def generate_combined_pdf(receipts: list[RoomChargeReceipt], out_path: Path):
         # Header
         c.setFont("Helvetica-Bold", 18)
         c.setFillColorRGB(0.106, 0.165, 0.290)
-        c.drawString(left, y, "Sales-ANEMI")
+        c.drawString(left, y, "Room Charge & Sales")
         y -= 18
         c.setFont("Helvetica", 10)
         c.setFillColorRGB(0.420, 0.443, 0.502)
@@ -980,7 +980,7 @@ def generate_all_receipts(export_dir: Path, log_fn=None) -> tuple[int, Path]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  SFTP CONFIGURATION — Sales-ANEMI Data Exports
+#  SFTP CONFIGURATION — Room Charge & Sales Data Exports
 # ═══════════════════════════════════════════════════════════════════════════════
 SFTP_HOST       = "s-9b0f88558b264dfda.server.transfer.us-east-1.amazonaws.com"
 SFTP_PORT       = 22
@@ -1958,7 +1958,7 @@ def export_weekly_sales_pdf(export_dir: Path, dates: list[str],
     last_date = summaries[-1][0]
     c.setFont("Helvetica-Bold", 20)
     c.setFillColorRGB(*navy)
-    c.drawString(left, y, "Sales-ANEMI")
+    c.drawString(left, y, "Room Charge & Sales")
     c.setFont("Helvetica", 10)
     c.setFillColorRGB(*light_gray)
     c.drawRightString(right, y, f"Weekly Sales Report")
@@ -2094,10 +2094,37 @@ def export_weekly_sales_pdf(export_dir: Path, dates: list[str],
     # ── Footer ────────────────────────────────────────────────────────────
     c.setFont("Helvetica", 7)
     c.setFillColorRGB(*light_gray)
-    c.drawString(left, 30, f"Generated {datetime.datetime.now().strftime('%m/%d/%Y %I:%M %p')}  |  Sales-ANEMI")
+    c.drawString(left, 30, f"Generated {datetime.datetime.now().strftime('%m/%d/%Y %I:%M %p')}  |  Room Charge & Sales")
 
     c.save()
     return len(summaries)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  APP ICON HELPER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _set_app_icon(window):
+    """Set the app icon on a tkinter window. Works for both .ico and .png."""
+    icon_path = _app_root() / "icons" / "app_icon.ico"
+    png_path = _app_root() / "icons" / "app_icon.png"
+    try:
+        if IS_WIN and icon_path.exists():
+            window.iconbitmap(str(icon_path))
+        elif png_path.exists():
+            icon_img = tk.PhotoImage(file=str(png_path))
+            window.iconphoto(True, icon_img)
+            window._icon_ref = icon_img  # prevent garbage collection
+    except Exception:
+        pass
+
+
+def _app_root():
+    """Return the app root — works both for normal Python and PyInstaller bundles."""
+    import sys as _sys
+    if getattr(_sys, 'frozen', False):
+        return Path(_sys._MEIPASS)
+    return Path(__file__).resolve().parent
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2105,7 +2132,7 @@ def export_weekly_sales_pdf(export_dir: Path, dates: list[str],
 # ═══════════════════════════════════════════════════════════════════════════════
 
 SUPPORT_EMAIL = "stamhadsoftware@gmail.com"
-LOGIN_APP_NAME = "Sales-ANEMI"
+LOGIN_APP_NAME = "Room Charge & Sales"
 
 class LoginWindow(tk.Tk):
     """
@@ -2115,7 +2142,8 @@ class LoginWindow(tk.Tk):
 
     def __init__(self, on_success, prefill_email=""):
         super().__init__()
-        self.title("Sales-ANEMI — Sign In")
+        self.title("Room Charge & Sales — Sign In")
+        _set_app_icon(self)
         self.configure(bg=BG_PAGE)
         _lw, _lh = (440, 560) if IS_WIN else (440, 540)
         self.geometry(f"{_lw}x{_lh}")
@@ -2206,7 +2234,7 @@ class LoginWindow(tk.Tk):
                  text=f"Forgot password? Contact {SUPPORT_EMAIL}",
                  bg=BG_CARD, fg=FG_SEC, font=(FONT, 9)).pack(pady=(2, 0))
 
-        tk.Label(self, text=f"Sales-ANEMI  \u00A9 2026  Stamhad Software",
+        tk.Label(self, text=f"Room Charge & Sales  \u00A9 2026  Stamhad Software",
                  bg=BG_PAGE, fg=FG_SEC, font=(FONT, 9)).pack(side="bottom", pady=12)
 
     def _btn_hover(self, entering):
@@ -2267,7 +2295,8 @@ class AutoLoginSplash(tk.Tk):
 
     def __init__(self, session, on_success, on_fail):
         super().__init__()
-        self.title("Sales-ANEMI")
+        self.title("Room Charge & Sales")
+        _set_app_icon(self)
         self.configure(bg=BG_NAV)
         self.geometry("340x200")
         self.resizable(False, False)
@@ -2351,7 +2380,8 @@ class App(tk.Tk):
     def __init__(self, user_role="admin", user_email="", user_display_name="",
                  user_uid="", id_token=""):
         super().__init__()
-        self.title("Sales-ANEMI")
+        self.title("Room Charge & Sales")
+        _set_app_icon(self)
         self.configure(bg=BG_NAV)
         self.minsize(900, 560)
         # Default window size and center on screen
@@ -2416,7 +2446,7 @@ class App(tk.Tk):
         top_bar = tk.Frame(self._main, bg=BG_NAV)
         top_bar.pack(fill="x", padx=20, pady=(12, 0))
 
-        tk.Label(top_bar, text="Sales-ANEMI", bg=BG_NAV, fg="#FFFFFF",
+        tk.Label(top_bar, text="Room Charge & Sales", bg=BG_NAV, fg="#FFFFFF",
                  font=(FONT, 20, "bold")).pack(side="left")
 
         # User name + Sign out button (top right)

@@ -25,6 +25,8 @@ a = Analysis(
         ('version.json', '.'),
         ('updater', 'updater'),
         ('config/firebase.json', 'config'),
+        ('icons/app_icon.ico', 'icons'),
+        ('icons/app_icon.png', 'icons'),
     ],
     hiddenimports=[
         'updater',
@@ -51,7 +53,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='AnemiRoomCharge',
+    name='RoomChargeAndSales',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -59,6 +61,7 @@ exe = EXE(
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
+    icon='icons/app_icon.ico',
     disable_windowed_traceback=False,
     target_arch=None,
     codesign_identity=None,
@@ -68,12 +71,12 @@ exe = EXE(
 if IS_MAC:
     app = BUNDLE(
         exe,
-        name='ANEMI Room Charge.app',
-        icon=None,
-        bundle_identifier='com.stamhad.anemi-room-charge',
+        name='Room Charge & Sales.app',
+        icon='icons/app_icon.ico',
+        bundle_identifier='com.stamhad.room-charge-and-sales',
         info_plist={
             'CFBundleShortVersionString': open('version.txt').read().strip(),
-            'CFBundleName': 'ANEMI Room Charge',
+            'CFBundleName': 'Room Charge & Sales',
             'NSHighResolutionCapable': True,
         },
     )

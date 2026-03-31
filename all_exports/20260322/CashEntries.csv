@@ -1,0 +1,5 @@
+Location,Entry Id,Created Date,Action,Amount,Cash Drawer,Payout Reason,No Sale Reason,Comment,Employee,Employee 2
+3017 31st street.,1400000004831367470,3/22/26 8:18 PM,CASH_PAYMENT,30.48,Bar RP - TP200250107200110,,,Cash payment,BAR BAR,
+3017 31st street.,1400000004832598142,3/22/26 9:09 PM,NO_SALE,0.00,Bar RP - TP200250107200110,,Count Drawer,,BAR BAR,
+3017 31st street.,1400000004834089167,3/22/26 10:45 PM,NO_SALE,0.00,Bar RP - TP200250107200110,,Count Drawer,,BAR BAR,
+3017 31st street.,1400000004834212460,3/22/26 10:58 PM,CLOSE_OUT_EXACT,0.00,Bar RP - TP200250107200110,,,Close out balance matches expected balance,Georgios Kalosis,
