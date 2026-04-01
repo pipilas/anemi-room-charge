@@ -1,10 +1,10 @@
 {
-  "latest_version": "1.2.61",
+  "latest_version": "1.2.7",
   "minimum_version": "1.0.0",
   "release_date": "2026-04-01",
   "download_url_windows": "",
   "download_url_mac": "",
-  "release_notes": "Fix monthly export to include all Firebase data, paginated order fetching",
+  "release_notes": "Fix auto-updater: read version from version.txt, update app in-place instead of always /Applications",
   "mandatory": false,
   "checksum_sha256": ""
 }

@@ -209,18 +209,34 @@ class Updater:
             subprocess.Popen(["xdg-open", installer_path])
             os._exit(0)
 
+    def _get_current_app_path(self) -> str:
+        """
+        Find the .app bundle path the current process is running from.
+        Returns the path to the .app directory, or empty string if not
+        running from a bundle.
+        """
+        exe = os.path.realpath(sys.executable)
+        # Walk up from the executable to find the .app bundle
+        # e.g. /Applications/Room Charge & Sales.app/Contents/MacOS/RoomChargeAndSales
+        parts = exe.split(os.sep)
+        for i, part in enumerate(parts):
+            if part.endswith(".app"):
+                return os.sep + os.path.join(*parts[1:i+1])
+        return ""
+
     def _install_mac(self, dmg_path, _status):
         """
         macOS auto-install using a background shell script.
 
         The script runs AFTER the app exits, so there are no file-lock
-        issues when replacing the .app bundle in /Applications.
+        issues when replacing the .app bundle.
 
         Flow:
         1. Write a temp shell script that will:
            a. Wait for this process to exit
            b. Mount the DMG
-           c. Copy the .app to /Applications
+           c. Copy the .app to where the current app is running from
+              (falls back to /Applications if detection fails)
            d. Unmount the DMG
            e. Relaunch the new .app
            f. Clean up
@@ -231,10 +247,20 @@ class Updater:
 
         _status("Preparing update...")
 
+        # Detect where the currently running app lives so we replace THAT copy
+        current_app = self._get_current_app_path()
+        if current_app:
+            # Install destination = same folder the current app is in
+            install_dir = os.path.dirname(current_app)
+        else:
+            install_dir = "/Applications"
+
         # Build a shell script that does the heavy lifting after we quit
         script_content = f'''#!/bin/bash
 # Wait for the current app to fully exit
 sleep 2
+
+INSTALL_DIR="{install_dir}"
 
 # Mount the DMG
 MOUNT_OUTPUT=$(hdiutil attach "{dmg_path}" -nobrowse -noverify -noautoopen 2>&1)
@@ -260,7 +286,7 @@ if [ -z "$APP_NAME" ]; then
 fi
 
 SOURCE="$MOUNT_POINT/$APP_NAME"
-DEST="/Applications/$APP_NAME"
+DEST="$INSTALL_DIR/$APP_NAME"
 
 # Remove old version and copy new one
 rm -rf "$DEST" 2>/dev/null
@@ -268,7 +294,7 @@ cp -R "$SOURCE" "$DEST"
 
 if [ $? -ne 0 ]; then
     hdiutil detach "$MOUNT_POINT" -quiet 2>/dev/null
-    osascript -e 'display alert "Update Failed" message "Could not copy to Applications. Try dragging the app manually."'
+    osascript -e 'display alert "Update Failed" message "Could not copy to $INSTALL_DIR. Try dragging the app manually."'
     open "$MOUNT_POINT"
     exit 1
 fi
