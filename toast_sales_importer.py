@@ -3605,7 +3605,8 @@ class App(tk.Tk):
     def _export_month_pdf(self, which: str = "this"):
         """
         Generate a combined PDF for this month or last month.
-        Tries local files first, then Firebase data.
+        Firebase is the PRIMARY data source — always fetched first.
+        Local CSV / cache data supplements anything Firebase missed.
         which: "this" for current month, "last" for previous month.
         """
         if self._running:
@@ -3631,112 +3632,7 @@ class App(tk.Tk):
         month_label = first_day.strftime("%m-%Y")    # e.g. "03-2026"
         month_display = first_day.strftime("%B %Y")  # e.g. "March 2026"
 
-        # ── Collect receipts from all sources ─────────────────────────────
-        month_receipts_by_key: dict[tuple[str, str], RoomChargeReceipt] = {}
-        out_dir = self._settings.get("output_folder", str(SFTP_DEFAULT_OUT))
-        export_path = Path(out_dir)
-
-        # Check for existing generated PDF
-        receipts_dir = export_path / "charge_receipts"
-        existing_pdf = receipts_dir / f"{month_label}.pdf"
-        if which == "last" and existing_pdf.exists():
-            save_path = filedialog.asksaveasfilename(
-                title=f"Export {month_display} PDF",
-                initialfile=f"{month_label}.pdf",
-                defaultextension=".pdf",
-                filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
-                parent=self)
-            if save_path:
-                import shutil
-                try:
-                    shutil.copy2(str(existing_pdf), save_path)
-                    Toast(self, f"Exported {month_display} PDF!")
-                except Exception as exc:
-                    messagebox.showerror("Export Error",
-                                         f"Failed to export PDF:\n{exc}",
-                                         parent=self)
-            return
-
-        # Source 1: In-memory cache (from browsing weeks in the UI)
-        if hasattr(self, "_all_receipts_cache"):
-            for date_key, receipts_dict in self._all_receipts_cache.items():
-                try:
-                    dt = datetime.datetime.strptime(date_key, "%Y%m%d").date()
-                    if first_day <= dt <= last_day:
-                        for (df, cid), r in receipts_dict.items():
-                            month_receipts_by_key[(df, cid)] = r
-                except ValueError:
-                    continue
-
-        # Source 2: Local CSV data
-        if export_path.exists():
-            try:
-                all_receipts = find_room_charges(export_path)
-                for r in all_receipts:
-                    try:
-                        dt = datetime.datetime.strptime(r.date_folder, "%Y%m%d").date()
-                        if first_day <= dt <= last_day:
-                            # Local CSV data overwrites cached data
-                            month_receipts_by_key[(r.date_folder, r.check_id)] = r
-                    except ValueError:
-                        continue
-            except Exception:
-                pass
-
-        # Source 3: Firebase (fill in any missing days/checks)
-        if AUTH_OK and hasattr(self, "_id_token") and self._id_token:
-            try:
-                # Generate all date keys for the month range
-                date_keys = []
-                d = first_day
-                while d <= last_day:
-                    date_keys.append(d.strftime("%Y%m%d"))
-                    d += datetime.timedelta(days=1)
-
-                orders = auth.fetch_orders(self._id_token, date_keys)
-                for o in orders:
-                    df = str(o.get("date_folder", ""))
-                    cid = str(o.get("check_id", ""))
-                    if (df, cid) in month_receipts_by_key:
-                        continue  # already have this receipt
-                    items = []
-                    for it in o.get("items", []):
-                        items.append(ReceiptItem(
-                            name=str(it.get("name", "")),
-                            qty=float(it.get("qty", 0)),
-                            net_price=float(it.get("net_price", 0)),
-                            tax=float(it.get("tax", 0)),
-                        ))
-                    month_receipts_by_key[(df, cid)] = RoomChargeReceipt(
-                        date_folder=df,
-                        check_id=cid,
-                        check_number=str(o.get("check_number", "")),
-                        tab_name=str(o.get("tab_name", "")),
-                        server=str(o.get("server", "")),
-                        table=str(o.get("table", "")),
-                        paid_date=str(o.get("paid_date", "")),
-                        subtotal=float(o.get("subtotal", 0)),
-                        tax_total=float(o.get("tax_total", 0)),
-                        tip=float(o.get("tip", 0)),
-                        total=float(o.get("total", 0)),
-                        charge_type=str(o.get("charge_type", "Room Charge")),
-                        items=items,
-                    )
-            except Exception:
-                pass
-
-        month_receipts = list(month_receipts_by_key.values())
-
-        if not month_receipts:
-            messagebox.showinfo("No Data",
-                                f"No charge receipts found for {month_display}.",
-                                parent=self)
-            return
-
-        # Sort by date, then by check number for consistent ordering
-        month_receipts.sort(key=lambda r: (r.date_folder, r.check_number))
-
-        # Ask user where to save
+        # Ask user where to save FIRST (so they can cancel before the fetch)
         save_path = filedialog.asksaveasfilename(
             title=f"Export {month_display} PDF",
             initialfile=f"{month_label}.pdf",
@@ -3746,14 +3642,152 @@ class App(tk.Tk):
         if not save_path:
             return
 
-        try:
-            generate_combined_pdf(month_receipts, Path(save_path))
-            Toast(self, f"Exported {month_display} — "
-                        f"{len(month_receipts)} receipts!")
-        except Exception as exc:
-            messagebox.showerror("Export Error",
-                                 f"Failed to generate PDF:\n{exc}",
-                                 parent=self)
+        # ── Show a progress window while fetching ────────────────────────
+        progress_win = tk.Toplevel(self)
+        progress_win.title("Exporting…")
+        progress_win.resizable(False, False)
+        progress_win.transient(self)
+        progress_win.grab_set()
+        pw, ph = 340, 100
+        sx = self.winfo_rootx() + (self.winfo_width() - pw) // 2
+        sy = self.winfo_rooty() + (self.winfo_height() - ph) // 2
+        progress_win.geometry(f"{pw}x{ph}+{sx}+{sy}")
+        progress_label = tk.Label(progress_win,
+                                  text=f"Fetching {month_display} data from cloud…",
+                                  font=("Helvetica", 12))
+        progress_label.pack(expand=True, padx=20, pady=20)
+
+        def _update_label(msg):
+            try:
+                progress_label.config(text=msg)
+                progress_win.update_idletasks()
+            except Exception:
+                pass
+
+        def _do_export():
+            error_msg = ""
+            month_receipts_by_key: dict[tuple[str, str], RoomChargeReceipt] = {}
+            firebase_ok = False
+
+            # ── Source 1 (PRIMARY): Firebase ──────────────────────────────
+            if AUTH_OK and hasattr(self, "_id_token") and self._id_token:
+                try:
+                    date_keys = []
+                    d = first_day
+                    while d <= last_day:
+                        date_keys.append(d.strftime("%Y%m%d"))
+                        d += datetime.timedelta(days=1)
+
+                    self.after(0, lambda: _update_label(
+                        f"Fetching {month_display} from cloud…"))
+
+                    orders = auth.fetch_orders(self._id_token, date_keys)
+                    for o in orders:
+                        df = str(o.get("date_folder", ""))
+                        cid = str(o.get("check_id", ""))
+                        items = []
+                        for it in o.get("items", []):
+                            items.append(ReceiptItem(
+                                name=str(it.get("name", "")),
+                                qty=float(it.get("qty", 0)),
+                                net_price=float(it.get("net_price", 0)),
+                                tax=float(it.get("tax", 0)),
+                            ))
+                        month_receipts_by_key[(df, cid)] = RoomChargeReceipt(
+                            date_folder=df,
+                            check_id=cid,
+                            check_number=str(o.get("check_number", "")),
+                            tab_name=str(o.get("tab_name", "")),
+                            server=str(o.get("server", "")),
+                            table=str(o.get("table", "")),
+                            paid_date=str(o.get("paid_date", "")),
+                            subtotal=float(o.get("subtotal", 0)),
+                            tax_total=float(o.get("tax_total", 0)),
+                            tip=float(o.get("tip", 0)),
+                            total=float(o.get("total", 0)),
+                            charge_type=str(o.get("charge_type", "Room Charge")),
+                            items=items,
+                        )
+                    firebase_ok = True
+                except Exception as exc:
+                    error_msg = f"Firebase fetch error: {exc}"
+
+            fb_count = len(month_receipts_by_key)
+
+            # ── Source 2: Local CSV data (fills in anything Firebase missed) ──
+            self.after(0, lambda: _update_label("Checking local files…"))
+            out_dir = self._settings.get("output_folder", str(SFTP_DEFAULT_OUT))
+            export_path = Path(out_dir)
+            if export_path.exists():
+                try:
+                    all_receipts = find_room_charges(export_path)
+                    for r in all_receipts:
+                        try:
+                            dt = datetime.datetime.strptime(
+                                r.date_folder, "%Y%m%d").date()
+                            if first_day <= dt <= last_day:
+                                if (r.date_folder, r.check_id) not in month_receipts_by_key:
+                                    month_receipts_by_key[
+                                        (r.date_folder, r.check_id)] = r
+                        except ValueError:
+                            continue
+                except Exception:
+                    pass
+
+            # ── Source 3: In-memory cache (fills in remaining gaps) ───────
+            if hasattr(self, "_all_receipts_cache"):
+                for date_key, receipts_dict in self._all_receipts_cache.items():
+                    try:
+                        dt = datetime.datetime.strptime(
+                            date_key, "%Y%m%d").date()
+                        if first_day <= dt <= last_day:
+                            for (df, cid), r in receipts_dict.items():
+                                if (df, cid) not in month_receipts_by_key:
+                                    month_receipts_by_key[(df, cid)] = r
+                    except ValueError:
+                        continue
+
+            month_receipts = list(month_receipts_by_key.values())
+            total_count = len(month_receipts)
+            local_extra = total_count - fb_count
+
+            # ── Generate PDF ─────────────────────────────────────────────
+            if not month_receipts:
+                self.after(0, lambda: _finish_export(
+                    None, error_msg or f"No charge receipts found for {month_display}."))
+                return
+
+            month_receipts.sort(key=lambda r: (r.date_folder, r.check_number))
+
+            self.after(0, lambda: _update_label(
+                f"Generating PDF — {total_count} receipts…"))
+
+            try:
+                generate_combined_pdf(month_receipts, Path(save_path))
+                summary = (f"Exported {month_display} — "
+                           f"{total_count} receipts")
+                if firebase_ok:
+                    summary += f" ({fb_count} from cloud"
+                    if local_extra > 0:
+                        summary += f", +{local_extra} local"
+                    summary += ")"
+                self.after(0, lambda: _finish_export(summary, None))
+            except Exception as exc:
+                self.after(0, lambda: _finish_export(
+                    None, f"Failed to generate PDF:\n{exc}"))
+
+        def _finish_export(success_msg, err_msg):
+            try:
+                progress_win.grab_release()
+                progress_win.destroy()
+            except Exception:
+                pass
+            if err_msg:
+                messagebox.showerror("Export Error", err_msg, parent=self)
+            elif success_msg:
+                Toast(self, success_msg)
+
+        threading.Thread(target=_do_export, daemon=True).start()
 
     # ── Check for updates ───────────────────────────────────────────────────────
     def _check_for_updates(self):
