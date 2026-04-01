@@ -69,7 +69,21 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════════
 #  VERSION & UPDATE CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
-APP_VERSION = "1.2.5"
+def _read_version() -> str:
+    """Read version from version.txt, works both in dev and PyInstaller bundle."""
+    import sys
+    from pathlib import Path
+    # PyInstaller sets sys._MEIPASS to the temp extraction folder
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+    vf = base / "version.txt"
+    if vf.exists():
+        try:
+            return vf.read_text().strip()
+        except Exception:
+            pass
+    return "0.0.0"
+
+APP_VERSION = _read_version()
 GITHUB_USERNAME = "pipilas"
 GITHUB_REPO = "anemi-room-charge"
 
