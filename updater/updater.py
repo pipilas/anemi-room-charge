@@ -236,35 +236,46 @@ timeout /t 1 /nobreak >NUL
 goto :waitloop
 :done_waiting
 
-:: Small extra pause
-timeout /t 1 /nobreak >NUL
+:: Extra pause to ensure all file handles are released
+timeout /t 3 /nobreak >NUL
 
-:: Replace the old exe with the new one
+:: Delete the old exe (retry up to 3 times)
+set /a retries=0
+:delete_retry
 del /f /q "{current_exe}" >NUL 2>&1
-if exist "{current_exe}" (
-    timeout /t 2 /nobreak >NUL
-    del /f /q "{current_exe}" >NUL 2>&1
-)
+if not exist "{current_exe}" goto :delete_ok
+set /a retries+=1
+if %retries% geq 3 goto :delete_ok
+timeout /t 2 /nobreak >NUL
+goto :delete_retry
+:delete_ok
 
+:: Copy the new exe to the original location
 copy /y "{new_exe_path}" "{current_exe}" >NUL 2>&1
 if errorlevel 1 (
     :: Copy failed — try move instead
     move /y "{new_exe_path}" "{current_exe}" >NUL 2>&1
 )
 
+:: Verify the copy succeeded and the file is valid
 if not exist "{current_exe}" (
-    :: Last resort: put the new exe back as-is
-    copy /y "{new_exe_path}" "{current_exe}" >NUL 2>&1
+    echo Update failed: new exe not found at destination.
+    pause
+    goto :cleanup
 )
 
-:: Clean up downloaded file
-del /f /q "{new_exe_path}" >NUL 2>&1
+:: Wait for the file to be fully written to disk
+timeout /t 2 /nobreak >NUL
 
 :: Relaunch the updated app
 start "" "{current_exe}"
 
+:cleanup
+:: Clean up downloaded file
+del /f /q "{new_exe_path}" >NUL 2>&1
+
 :: Delete this batch file
-del /f /q "%~f0"
+(goto) 2>nul & del /f /q "%~f0"
 '''
 
         bat_path = os.path.join(tempfile.gettempdir(), "anemi_update.bat")
