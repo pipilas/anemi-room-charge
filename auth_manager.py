@@ -515,25 +515,39 @@ def fetch_orders(id_token: str, date_folders: list[str] | None = None) -> list[d
     orders whose date_folder field is in that list.
 
     Uses the Firestore REST list endpoint to get all /orders docs,
-    then filters client-side (avoids needing composite indexes).
+    with pagination to handle collections larger than 500 docs.
+    Filters client-side (avoids needing composite indexes).
     Returns a list of plain dicts.
     """
-    url = f"{_FIRESTORE_URL}/orders?pageSize=500"
+    all_docs = []
+    page_token = None
 
-    req = request.Request(
-        url,
-        headers={"Authorization": f"Bearer {id_token}"},
-        method="GET",
-    )
+    while True:
+        url = f"{_FIRESTORE_URL}/orders?pageSize=500"
+        if page_token:
+            url += f"&pageToken={page_token}"
 
-    try:
-        with request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode())
-    except Exception:
-        return []
+        req = request.Request(
+            url,
+            headers={"Authorization": f"Bearer {id_token}"},
+            method="GET",
+        )
+
+        try:
+            with request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode())
+        except Exception:
+            break
+
+        all_docs.extend(data.get("documents", []))
+
+        # Check for next page
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
 
     orders = []
-    for doc in data.get("documents", []):
+    for doc in all_docs:
         fields = doc.get("fields", {})
         order = {k: _parse_firestore_value(v) for k, v in fields.items()}
         orders.append(order)

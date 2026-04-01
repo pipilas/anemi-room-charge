@@ -1,10 +1,10 @@
 {
-  "latest_version": "1.2.5",
+  "latest_version": "1.2.6",
   "minimum_version": "1.0.0",
-  "release_date": "2026-03-28",
+  "release_date": "2026-04-01",
   "download_url_windows": "",
   "download_url_mac": "",
-  "release_notes": "New app icon, renamed to Room Charge & Sales, persistent Firebase cache",
+  "release_notes": "Fix monthly export to include all Firebase data, paginated order fetching",
   "mandatory": false,
   "checksum_sha256": ""
 }

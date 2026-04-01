@@ -3617,8 +3617,8 @@ class App(tk.Tk):
         month_label = first_day.strftime("%m-%Y")    # e.g. "03-2026"
         month_display = first_day.strftime("%B %Y")  # e.g. "March 2026"
 
-        # ── Try local files first ────────────────────────────────────────
-        month_receipts = []
+        # ── Collect receipts from all sources ─────────────────────────────
+        month_receipts_by_key: dict[tuple[str, str], RoomChargeReceipt] = {}
         out_dir = self._settings.get("output_folder", str(SFTP_DEFAULT_OUT))
         export_path = Path(out_dir)
 
@@ -3643,7 +3643,18 @@ class App(tk.Tk):
                                          parent=self)
             return
 
-        # Try local CSV data
+        # Source 1: In-memory cache (from browsing weeks in the UI)
+        if hasattr(self, "_all_receipts_cache"):
+            for date_key, receipts_dict in self._all_receipts_cache.items():
+                try:
+                    dt = datetime.datetime.strptime(date_key, "%Y%m%d").date()
+                    if first_day <= dt <= last_day:
+                        for (df, cid), r in receipts_dict.items():
+                            month_receipts_by_key[(df, cid)] = r
+                except ValueError:
+                    continue
+
+        # Source 2: Local CSV data
         if export_path.exists():
             try:
                 all_receipts = find_room_charges(export_path)
@@ -3651,13 +3662,14 @@ class App(tk.Tk):
                     try:
                         dt = datetime.datetime.strptime(r.date_folder, "%Y%m%d").date()
                         if first_day <= dt <= last_day:
-                            month_receipts.append(r)
+                            # Local CSV data overwrites cached data
+                            month_receipts_by_key[(r.date_folder, r.check_id)] = r
                     except ValueError:
                         continue
             except Exception:
                 pass
 
-        # ── Merge Firebase receipts (fill in any missing days/checks) ────
+        # Source 3: Firebase (fill in any missing days/checks)
         if AUTH_OK and hasattr(self, "_id_token") and self._id_token:
             try:
                 # Generate all date keys for the month range
@@ -3667,16 +3679,12 @@ class App(tk.Tk):
                     date_keys.append(d.strftime("%Y%m%d"))
                     d += datetime.timedelta(days=1)
 
-                # Track existing local receipts by (date_folder, check_id)
-                existing_ids = {(r.date_folder, r.check_id)
-                                for r in month_receipts}
-
                 orders = auth.fetch_orders(self._id_token, date_keys)
                 for o in orders:
                     df = str(o.get("date_folder", ""))
                     cid = str(o.get("check_id", ""))
-                    if (df, cid) in existing_ids:
-                        continue  # already have this receipt locally
+                    if (df, cid) in month_receipts_by_key:
+                        continue  # already have this receipt
                     items = []
                     for it in o.get("items", []):
                         items.append(ReceiptItem(
@@ -3685,7 +3693,7 @@ class App(tk.Tk):
                             net_price=float(it.get("net_price", 0)),
                             tax=float(it.get("tax", 0)),
                         ))
-                    month_receipts.append(RoomChargeReceipt(
+                    month_receipts_by_key[(df, cid)] = RoomChargeReceipt(
                         date_folder=df,
                         check_id=cid,
                         check_number=str(o.get("check_number", "")),
@@ -3699,9 +3707,11 @@ class App(tk.Tk):
                         total=float(o.get("total", 0)),
                         charge_type=str(o.get("charge_type", "Room Charge")),
                         items=items,
-                    ))
+                    )
             except Exception:
                 pass
+
+        month_receipts = list(month_receipts_by_key.values())
 
         if not month_receipts:
             messagebox.showinfo("No Data",
