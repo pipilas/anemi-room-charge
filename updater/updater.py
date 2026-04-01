@@ -1,6 +1,6 @@
 """
 Updater — checks GitHub for new versions, downloads and installs updates.
-Works with any Python tkinter app.  All app-specific values passed as parameters.
+Works with any Python tkinter app. All app-specific values passed as parameters.
 
 Supports:
   - Windows: downloads .exe, runs it, exits current app
@@ -34,13 +34,13 @@ class Updater:
         updater = Updater(
             github_username="pipilas",
             github_repo="anemi-room-charge",
-            app_name="ANEMI Room Charge"
+            app_name="Room Charge & Sales"
         )
         updater.check_and_prompt(parent_window=root)
     """
 
-    def __init__(self, current_version=None, github_username="",
-                 github_repo="", app_name="App", version_file=None):
+    def __init__(self, current_version=None, github_username="", github_repo="",
+                 app_name="App", version_file=None):
         self.current_version = current_version or get_version(version_file)
         self.github_username = github_username
         self.github_repo = github_repo
@@ -52,8 +52,7 @@ class Updater:
 
     def check_for_updates(self):
         """
-        Check GitHub for new version.
-        Returns dict with update info.
+        Check GitHub for new version. Returns dict with update info.
         Raises ConnectionError on network failure.
         """
         try:
@@ -102,7 +101,6 @@ class Updater:
         asset matching the given version tag (e.g. 'v1.2.4' or '1.2.4').
         Returns the browser_download_url or empty string if not found.
         """
-        # Try both 'v1.2.4' and '1.2.4' tag formats
         tags_to_try = [f"v{version}", version]
         ext = ".dmg" if IS_MAC else ".exe"
 
@@ -145,8 +143,8 @@ class Updater:
         total = int(resp.headers.get("Content-Length", 0))
         downloaded = 0
         chunk_size = 65536
-        sha = hashlib.sha256()
 
+        sha = hashlib.sha256()
         with open(download_path, "wb") as f:
             while True:
                 chunk = resp.read(chunk_size)
@@ -160,6 +158,7 @@ class Updater:
                         progress_callback(downloaded, total)
                     except Exception:
                         pass
+
         resp.close()
 
         # Verify checksum
@@ -184,6 +183,7 @@ class Updater:
         Install the update and relaunch.
         - Windows: runs the .exe installer, exits current app
         - macOS:   mounts DMG, copies .app to /Applications, relaunches
+        status_callback(message) is called with progress messages.
         """
         if not os.path.exists(installer_path):
             raise FileNotFoundError(f"Installer not found: {installer_path}")
@@ -201,200 +201,142 @@ class Updater:
             import time
             time.sleep(0.5)
             os._exit(0)
+
         elif IS_MAC:
             self._install_mac(installer_path, _status)
+
         else:
             # Linux fallback
             _status("Opening installer...")
             subprocess.Popen(["xdg-open", installer_path])
             os._exit(0)
 
-    def _get_current_app_path(self) -> str:
-        """
-        Find the .app bundle path the current process is running from.
-        Handles macOS App Translocation (Gatekeeper path randomisation).
-        Returns the REAL path to the .app directory, or empty string.
-        """
-        exe = os.path.realpath(sys.executable)
-        # Walk up from the executable to find the .app bundle
-        # e.g. /Applications/Room Charge & Sales.app/Contents/MacOS/RoomChargeAndSales
-        parts = exe.split(os.sep)
-        app_path = ""
-        for i, part in enumerate(parts):
-            if part.endswith(".app"):
-                app_path = os.sep + os.path.join(*parts[1:i+1])
-                break
-
-        if not app_path:
-            return ""
-
-        # Detect App Translocation — macOS runs quarantined apps from a
-        # randomised /private/var/folders/.../AppTranslocation/... path.
-        # Copying there is useless; it's ephemeral.  Fall back to "".
-        if "/AppTranslocation/" in app_path:
-            return ""
-
-        return app_path
-
     def _install_mac(self, dmg_path, _status):
         """
-        macOS auto-install using a background shell script.
-
-        The script runs AFTER the app exits, so there are no file-lock
-        issues when replacing the .app bundle.
-
-        Flow:
-        1. Write a temp shell script that will:
-           a. Wait for this PID to exit (not just sleep)
-           b. Mount the DMG
-           c. Copy the .app using ditto (preserves macOS metadata)
-           d. Clear quarantine attributes
-           e. Unmount the DMG
-           f. Relaunch the new .app
-           g. Clean up
-        2. Launch the script in the background
-        3. Exit the current app immediately
+        macOS auto-install — all done in-process (no shell script).
+        1. Mount the DMG
+        2. Find the .app inside
+        3. Copy it to /Applications (replacing old version)
+        4. Unmount the DMG
+        5. Relaunch from /Applications
         """
-        import tempfile
+        mount_point = None
 
-        _status("Preparing update...")
+        try:
+            # ── Step 1: Mount DMG ────────────────────────────────────────
+            _status("Mounting disk image...")
+            result = subprocess.run(
+                ["hdiutil", "attach", dmg_path,
+                 "-nobrowse", "-noverify", "-noautoopen"],
+                capture_output=True, text=True, timeout=60
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"Failed to mount DMG: {result.stderr}")
 
-        my_pid = os.getpid()
+            # Parse mount point from hdiutil output (tab-separated)
+            for line in result.stdout.strip().split("\n"):
+                parts = line.split("\t")
+                if len(parts) >= 3:
+                    mount_point = parts[-1].strip()
 
-        # Detect where the currently running app lives so we replace THAT copy.
-        # Falls back to /Applications if detection fails (e.g. App Translocation).
-        current_app = self._get_current_app_path()
-        if current_app:
-            install_dir = os.path.dirname(current_app)
-        else:
-            install_dir = "/Applications"
+            if not mount_point or not os.path.isdir(mount_point):
+                raise RuntimeError("Could not determine DMG mount point.")
 
-        log_path = os.path.join(tempfile.gettempdir(), "anemi_update.log")
+            # ── Step 2: Find the .app ────────────────────────────────────
+            _status("Finding application...")
+            app_name = None
+            for item in os.listdir(mount_point):
+                if item.endswith(".app"):
+                    app_name = item
+                    break
 
-        # Build a shell script that does the heavy lifting after we quit
-        script_content = f'''#!/bin/bash
-LOG="{log_path}"
-echo "=== Update started $(date) ===" > "$LOG"
-echo "PID to wait for: {my_pid}" >> "$LOG"
-echo "Install dir: {install_dir}" >> "$LOG"
+            if not app_name:
+                raise RuntimeError("No .app found inside the DMG.")
 
-# Wait for the current app process to fully exit (up to 30 seconds)
-for i in $(seq 1 30); do
-    if ! kill -0 {my_pid} 2>/dev/null; then
-        echo "Process exited after $i seconds" >> "$LOG"
-        break
-    fi
-    sleep 1
-done
-# Extra safety pause
-sleep 1
+            source_app = os.path.join(mount_point, app_name)
+            dest_app = os.path.join("/Applications", app_name)
 
-# Mount the DMG
-echo "Mounting DMG: {dmg_path}" >> "$LOG"
-MOUNT_OUTPUT=$(hdiutil attach "{dmg_path}" -nobrowse -noverify -noautoopen 2>&1)
-if [ $? -ne 0 ]; then
-    echo "FAILED to mount DMG: $MOUNT_OUTPUT" >> "$LOG"
-    osascript -e 'display alert "Update Failed" message "Could not mount the disk image. Please install manually from the Downloads folder."'
-    exit 1
-fi
-echo "Mount output: $MOUNT_OUTPUT" >> "$LOG"
+            # ── Step 3: Remove old version and copy new one ──────────────
+            _status("Installing update...")
+            if os.path.exists(dest_app):
+                shutil.rmtree(dest_app)
 
-# Find mount point (last column of last line)
-MOUNT_POINT=$(echo "$MOUNT_OUTPUT" | tail -1 | awk '{{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}}' | sed 's/ *$//')
-echo "Mount point: $MOUNT_POINT" >> "$LOG"
+            shutil.copytree(source_app, dest_app)
+            _status("Update installed!")
 
-if [ ! -d "$MOUNT_POINT" ]; then
-    echo "FAILED: mount point not a directory" >> "$LOG"
-    osascript -e 'display alert "Update Failed" message "Could not find mounted volume."'
-    exit 1
-fi
+            # ── Step 4: Unmount DMG ──────────────────────────────────────
+            try:
+                subprocess.run(
+                    ["hdiutil", "detach", mount_point, "-quiet"],
+                    timeout=30, capture_output=True
+                )
+            except Exception:
+                pass  # Non-critical
 
-# Find the .app inside
-APP_NAME=$(ls "$MOUNT_POINT" | grep '\\.app$' | head -1)
-echo "App name in DMG: $APP_NAME" >> "$LOG"
+            # Clean up downloaded DMG
+            try:
+                os.remove(dmg_path)
+            except Exception:
+                pass
 
-if [ -z "$APP_NAME" ]; then
-    hdiutil detach "$MOUNT_POINT" -quiet 2>/dev/null
-    echo "FAILED: no .app found in DMG" >> "$LOG"
-    osascript -e 'display alert "Update Failed" message "No application found in the disk image."'
-    exit 1
-fi
+            # ── Step 5: Relaunch ─────────────────────────────────────────
+            _status("Relaunching...")
+            import time
+            time.sleep(1)  # brief pause to let OS release locks
+            subprocess.Popen(["open", "-n", "-a", dest_app])
+            time.sleep(0.5)
+            os._exit(0)  # force-kill current process
 
-SOURCE="$MOUNT_POINT/$APP_NAME"
-DEST="{install_dir}/$APP_NAME"
-echo "Source: $SOURCE" >> "$LOG"
-echo "Dest: $DEST" >> "$LOG"
+        except Exception as e:
+            # Try to unmount on error
+            if mount_point:
+                try:
+                    subprocess.run(
+                        ["hdiutil", "detach", mount_point, "-quiet"],
+                        timeout=15, capture_output=True
+                    )
+                except Exception:
+                    pass
+            raise RuntimeError(f"macOS install failed: {e}")
 
-# Remove old version
-echo "Removing old app at: $DEST" >> "$LOG"
-rm -rf "$DEST"
-if [ -d "$DEST" ]; then
-    echo "WARNING: rm -rf did not fully remove old app, retrying..." >> "$LOG"
-    sleep 2
-    rm -rf "$DEST"
-fi
+    def is_mandatory_update(self, server_data):
+        """Returns True if the update is mandatory or below minimum version."""
+        if server_data.get("mandatory", False):
+            return True
+        minimum = server_data.get("minimum_version", "0.0.0")
+        if compare_versions(self.current_version, minimum) < 0:
+            return True
+        return False
 
-# Copy new version using ditto (preserves macOS resource forks & metadata)
-echo "Copying with ditto..." >> "$LOG"
-ditto "$SOURCE" "$DEST" 2>>"$LOG"
-COPY_RESULT=$?
-echo "ditto exit code: $COPY_RESULT" >> "$LOG"
+    def silent_auto_update(self):
+        """
+        Fully silent auto-update. Call BEFORE launching the main app.
+        - Checks GitHub for a new version
+        - If found, downloads and installs silently
+        - Relaunches the new version, exits current process
+        - If no update or any error, returns silently so the app can start normally
+        """
+        try:
+            result = self.check_for_updates()
+        except Exception:
+            return  # No internet or error — skip silently
 
-if [ $COPY_RESULT -ne 0 ]; then
-    hdiutil detach "$MOUNT_POINT" -quiet 2>/dev/null
-    echo "FAILED: ditto copy failed" >> "$LOG"
-    osascript -e 'display alert "Update Failed" message "Could not copy to {install_dir}. Try dragging the app manually."'
-    open "$MOUNT_POINT"
-    exit 1
-fi
+        if not result.get("update_available"):
+            return  # Already up to date
 
-# Clear quarantine flag so macOS does not block the app
-xattr -cr "$DEST" 2>/dev/null
-echo "Cleared quarantine attributes" >> "$LOG"
+        url = result.get("download_url", "")
+        checksum = result.get("checksum", "")
 
-# Verify the copy worked — check version.txt inside the bundle
-if [ -f "$DEST/Contents/Resources/version.txt" ]; then
-    NEW_VER=$(cat "$DEST/Contents/Resources/version.txt")
-    echo "New version inside bundle: $NEW_VER" >> "$LOG"
-else
-    echo "WARNING: version.txt not found inside bundle" >> "$LOG"
-fi
+        if not url:
+            return  # No download URL — skip
 
-# Unmount and clean up
-hdiutil detach "$MOUNT_POINT" -quiet 2>/dev/null
-rm -f "{dmg_path}" 2>/dev/null
-echo "Unmounted and cleaned up" >> "$LOG"
-
-# Relaunch
-sleep 1
-echo "Relaunching: $DEST" >> "$LOG"
-open "$DEST"
-
-echo "=== Update finished $(date) ===" >> "$LOG"
-
-# Delete this script
-rm -f "$0"
-'''
-
-        # Write script to temp file
-        script_path = os.path.join(tempfile.gettempdir(), "anemi_update.sh")
-        with open(script_path, "w") as f:
-            f.write(script_content)
-        os.chmod(script_path, 0o755)
-
-        _status("Installing update — app will restart...")
-
-        # Launch the script in background and exit
-        subprocess.Popen(
-            ["/bin/bash", script_path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-
-        import time
-        time.sleep(0.5)
-        os._exit(0)
+        try:
+            # Download
+            installer_path = self.download_update(url, checksum)
+            # Install and relaunch (this calls os._exit on success)
+            self.install_update(installer_path)
+        except Exception:
+            return  # Download or install failed — skip, launch current version
 
     def check_and_prompt(self, parent_window=None):
         """
