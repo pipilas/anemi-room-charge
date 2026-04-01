@@ -2,8 +2,8 @@
   "latest_version": "1.2.6",
   "minimum_version": "1.0.0",
   "release_date": "2026-04-01",
-  "download_url_windows": "",
-  "download_url_mac": "",
+  "download_url_windows": "https://github.com/pipilas/anemi-room-charge/releases/download/v1.2.6/RoomChargeAndSales.exe",
+  "download_url_mac": "https://github.com/pipilas/anemi-room-charge/releases/download/v1.2.6/RoomChargeAndSales-1.2.6-mac.dmg",
   "release_notes": "Fix monthly export to include all Firebase data, paginated order fetching",
   "mandatory": false,
   "checksum_sha256": ""
