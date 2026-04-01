@@ -212,17 +212,29 @@ class Updater:
     def _get_current_app_path(self) -> str:
         """
         Find the .app bundle path the current process is running from.
-        Returns the path to the .app directory, or empty string if not
-        running from a bundle.
+        Handles macOS App Translocation (Gatekeeper path randomisation).
+        Returns the REAL path to the .app directory, or empty string.
         """
         exe = os.path.realpath(sys.executable)
         # Walk up from the executable to find the .app bundle
         # e.g. /Applications/Room Charge & Sales.app/Contents/MacOS/RoomChargeAndSales
         parts = exe.split(os.sep)
+        app_path = ""
         for i, part in enumerate(parts):
             if part.endswith(".app"):
-                return os.sep + os.path.join(*parts[1:i+1])
-        return ""
+                app_path = os.sep + os.path.join(*parts[1:i+1])
+                break
+
+        if not app_path:
+            return ""
+
+        # Detect App Translocation — macOS runs quarantined apps from a
+        # randomised /private/var/folders/.../AppTranslocation/... path.
+        # Copying there is useless; it's ephemeral.  Fall back to "".
+        if "/AppTranslocation/" in app_path:
+            return ""
+
+        return app_path
 
     def _install_mac(self, dmg_path, _status):
         """
@@ -233,13 +245,13 @@ class Updater:
 
         Flow:
         1. Write a temp shell script that will:
-           a. Wait for this process to exit
+           a. Wait for this PID to exit (not just sleep)
            b. Mount the DMG
-           c. Copy the .app to where the current app is running from
-              (falls back to /Applications if detection fails)
-           d. Unmount the DMG
-           e. Relaunch the new .app
-           f. Clean up
+           c. Copy the .app using ditto (preserves macOS metadata)
+           d. Clear quarantine attributes
+           e. Unmount the DMG
+           f. Relaunch the new .app
+           g. Clean up
         2. Launch the script in the background
         3. Exit the current app immediately
         """
@@ -247,65 +259,118 @@ class Updater:
 
         _status("Preparing update...")
 
-        # Detect where the currently running app lives so we replace THAT copy
+        my_pid = os.getpid()
+
+        # Detect where the currently running app lives so we replace THAT copy.
+        # Falls back to /Applications if detection fails (e.g. App Translocation).
         current_app = self._get_current_app_path()
         if current_app:
-            # Install destination = same folder the current app is in
             install_dir = os.path.dirname(current_app)
         else:
             install_dir = "/Applications"
 
+        log_path = os.path.join(tempfile.gettempdir(), "anemi_update.log")
+
         # Build a shell script that does the heavy lifting after we quit
         script_content = f'''#!/bin/bash
-# Wait for the current app to fully exit
-sleep 2
+LOG="{log_path}"
+echo "=== Update started $(date) ===" > "$LOG"
+echo "PID to wait for: {my_pid}" >> "$LOG"
+echo "Install dir: {install_dir}" >> "$LOG"
 
-INSTALL_DIR="{install_dir}"
+# Wait for the current app process to fully exit (up to 30 seconds)
+for i in $(seq 1 30); do
+    if ! kill -0 {my_pid} 2>/dev/null; then
+        echo "Process exited after $i seconds" >> "$LOG"
+        break
+    fi
+    sleep 1
+done
+# Extra safety pause
+sleep 1
 
 # Mount the DMG
+echo "Mounting DMG: {dmg_path}" >> "$LOG"
 MOUNT_OUTPUT=$(hdiutil attach "{dmg_path}" -nobrowse -noverify -noautoopen 2>&1)
 if [ $? -ne 0 ]; then
+    echo "FAILED to mount DMG: $MOUNT_OUTPUT" >> "$LOG"
     osascript -e 'display alert "Update Failed" message "Could not mount the disk image. Please install manually from the Downloads folder."'
     exit 1
 fi
+echo "Mount output: $MOUNT_OUTPUT" >> "$LOG"
 
 # Find mount point (last column of last line)
 MOUNT_POINT=$(echo "$MOUNT_OUTPUT" | tail -1 | awk '{{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}}' | sed 's/ *$//')
+echo "Mount point: $MOUNT_POINT" >> "$LOG"
 
 if [ ! -d "$MOUNT_POINT" ]; then
+    echo "FAILED: mount point not a directory" >> "$LOG"
     osascript -e 'display alert "Update Failed" message "Could not find mounted volume."'
     exit 1
 fi
 
 # Find the .app inside
 APP_NAME=$(ls "$MOUNT_POINT" | grep '\\.app$' | head -1)
+echo "App name in DMG: $APP_NAME" >> "$LOG"
+
 if [ -z "$APP_NAME" ]; then
     hdiutil detach "$MOUNT_POINT" -quiet 2>/dev/null
+    echo "FAILED: no .app found in DMG" >> "$LOG"
     osascript -e 'display alert "Update Failed" message "No application found in the disk image."'
     exit 1
 fi
 
 SOURCE="$MOUNT_POINT/$APP_NAME"
-DEST="$INSTALL_DIR/$APP_NAME"
+DEST="{install_dir}/$APP_NAME"
+echo "Source: $SOURCE" >> "$LOG"
+echo "Dest: $DEST" >> "$LOG"
 
-# Remove old version and copy new one
-rm -rf "$DEST" 2>/dev/null
-cp -R "$SOURCE" "$DEST"
+# Remove old version
+echo "Removing old app at: $DEST" >> "$LOG"
+rm -rf "$DEST"
+if [ -d "$DEST" ]; then
+    echo "WARNING: rm -rf did not fully remove old app, retrying..." >> "$LOG"
+    sleep 2
+    rm -rf "$DEST"
+fi
 
-if [ $? -ne 0 ]; then
+# Copy new version using ditto (preserves macOS resource forks & metadata)
+echo "Copying with ditto..." >> "$LOG"
+ditto "$SOURCE" "$DEST" 2>>"$LOG"
+COPY_RESULT=$?
+echo "ditto exit code: $COPY_RESULT" >> "$LOG"
+
+if [ $COPY_RESULT -ne 0 ]; then
     hdiutil detach "$MOUNT_POINT" -quiet 2>/dev/null
-    osascript -e 'display alert "Update Failed" message "Could not copy to $INSTALL_DIR. Try dragging the app manually."'
+    echo "FAILED: ditto copy failed" >> "$LOG"
+    osascript -e 'display alert "Update Failed" message "Could not copy to {install_dir}. Try dragging the app manually."'
     open "$MOUNT_POINT"
     exit 1
+fi
+
+# Clear quarantine flag so macOS does not block the app
+xattr -cr "$DEST" 2>/dev/null
+echo "Cleared quarantine attributes" >> "$LOG"
+
+# Verify the copy worked — check version.txt inside the bundle
+if [ -f "$DEST/Contents/Resources/version.txt" ]; then
+    NEW_VER=$(cat "$DEST/Contents/Resources/version.txt")
+    echo "New version inside bundle: $NEW_VER" >> "$LOG"
+else
+    echo "WARNING: version.txt not found inside bundle" >> "$LOG"
 fi
 
 # Unmount and clean up
 hdiutil detach "$MOUNT_POINT" -quiet 2>/dev/null
 rm -f "{dmg_path}" 2>/dev/null
+echo "Unmounted and cleaned up" >> "$LOG"
 
 # Relaunch
 sleep 1
-open -n -a "$DEST"
+echo "Relaunching: $DEST" >> "$LOG"
+open "$DEST"
+
+echo "=== Update finished $(date) ===" >> "$LOG"
 
 # Delete this script
 rm -f "$0"
