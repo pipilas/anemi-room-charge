@@ -207,18 +207,13 @@ class Updater:
 
     def _install_windows(self, installer_path, _status):
         """
-        Windows auto-install using a background batch script.
-
-        The script runs AFTER the app exits, so the exe is no longer locked.
+        Windows auto-install using a background VBS-launched batch script.
 
         Flow:
-        1. Write a temp batch script that will:
-           a. Wait for this process to exit
-           b. Copy the new exe over the old one
-           c. Relaunch from the original location
-           d. Clean up
-        2. Launch the script in the background
-        3. Exit the current app immediately
+        1. Write a batch script that waits a few seconds (for the app to exit),
+           copies the new exe over the old one, relaunches, and cleans up.
+        2. Write a tiny VBS wrapper to launch the batch script fully hidden.
+        3. Run the VBS wrapper and immediately exit the app.
         """
         _status("Preparing update...")
 
@@ -233,28 +228,15 @@ class Updater:
             time.sleep(0.5)
             os._exit(0)
 
-        pid = os.getpid()
-
         script_content = f'''@echo off
-:: Wait for the current app to fully exit
-:wait_loop
-tasklist /FI "PID eq {pid}" 2>NUL | find /I "{pid}" >NUL
-if not errorlevel 1 (
-    timeout /t 1 /nobreak >NUL
-    goto wait_loop
-)
-
-:: Small extra delay for file locks to release
-timeout /t 1 /nobreak >NUL
+:: Wait for the app to fully exit and release file locks
+timeout /t 4 /nobreak >NUL
 
 :: Replace the old exe with the new one
 copy /Y "{installer_path}" "{current_exe}"
 if errorlevel 1 (
-    echo Update failed — could not replace the application.
-    echo Please copy the new version manually from:
-    echo   {installer_path}
-    pause
-    exit /b 1
+    timeout /t 2 /nobreak >NUL
+    copy /Y "{installer_path}" "{current_exe}"
 )
 
 :: Clean up the downloaded file
@@ -271,15 +253,16 @@ del /f "%~f0"
         with open(script_path, "w") as f:
             f.write(script_content)
 
+        # VBS wrapper to run the batch script completely hidden
+        vbs_content = f'CreateObject("Wscript.Shell").Run """{script_path}""", 0, False\n'
+        vbs_path = os.path.join(tempfile.gettempdir(), "anemi_update.vbs")
+        with open(vbs_path, "w") as f:
+            f.write(vbs_content)
+
         _status("Installing update — app will restart...")
 
-        # Launch the batch script hidden and detached
-        subprocess.Popen(
-            ["cmd.exe", "/c", script_path],
-            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        # Launch via wscript (fully hidden, no window at all)
+        subprocess.Popen(["wscript.exe", vbs_path])
 
         import time
         time.sleep(0.5)
