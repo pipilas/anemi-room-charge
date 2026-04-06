@@ -1,6 +1,6 @@
 """
 Updater — checks GitHub for new versions, downloads and installs updates.
-Works with any Python tkinter app.  All app-specific values passed as parameters.
+Works with any Python tkinter app. All app-specific values passed as parameters.
 
 Supports:
   - Windows: downloads .exe, runs it, exits current app
@@ -34,13 +34,13 @@ class Updater:
         updater = Updater(
             github_username="pipilas",
             github_repo="anemi-room-charge",
-            app_name="ANEMI Room Charge"
+            app_name="Room Charge & Sales"
         )
         updater.check_and_prompt(parent_window=root)
     """
 
-    def __init__(self, current_version=None, github_username="",
-                 github_repo="", app_name="App", version_file=None):
+    def __init__(self, current_version=None, github_username="", github_repo="",
+                 app_name="App", version_file=None):
         self.current_version = current_version or get_version(version_file)
         self.github_username = github_username
         self.github_repo = github_repo
@@ -52,8 +52,7 @@ class Updater:
 
     def check_for_updates(self):
         """
-        Check GitHub for new version.
-        Returns dict with update info.
+        Check GitHub for new version. Returns dict with update info.
         Raises ConnectionError on network failure.
         """
         try:
@@ -102,7 +101,6 @@ class Updater:
         asset matching the given version tag (e.g. 'v1.2.4' or '1.2.4').
         Returns the browser_download_url or empty string if not found.
         """
-        # Try both 'v1.2.4' and '1.2.4' tag formats
         tags_to_try = [f"v{version}", version]
         ext = ".dmg" if IS_MAC else ".exe"
 
@@ -145,8 +143,8 @@ class Updater:
         total = int(resp.headers.get("Content-Length", 0))
         downloaded = 0
         chunk_size = 65536
-        sha = hashlib.sha256()
 
+        sha = hashlib.sha256()
         with open(download_path, "wb") as f:
             while True:
                 chunk = resp.read(chunk_size)
@@ -160,6 +158,7 @@ class Updater:
                         progress_callback(downloaded, total)
                     except Exception:
                         pass
+
         resp.close()
 
         # Verify checksum
@@ -184,6 +183,7 @@ class Updater:
         Install the update and relaunch.
         - Windows: runs the .exe installer, exits current app
         - macOS:   mounts DMG, copies .app to /Applications, relaunches
+        status_callback(message) is called with progress messages.
         """
         if not os.path.exists(installer_path):
             raise FileNotFoundError(f"Installer not found: {installer_path}")
@@ -196,114 +196,219 @@ class Updater:
                     pass
 
         if IS_WIN:
-            _status("Launching installer...")
-            subprocess.Popen([installer_path], shell=True)
-            import time
-            time.sleep(0.5)
-            os._exit(0)
+            self._install_windows(installer_path, _status)
+
         elif IS_MAC:
             self._install_mac(installer_path, _status)
+
         else:
             # Linux fallback
             _status("Opening installer...")
             subprocess.Popen(["xdg-open", installer_path])
             os._exit(0)
 
-    def _install_mac(self, dmg_path, _status):
+    def _install_windows(self, new_exe_path, _status):
         """
-        macOS auto-install using a background shell script.
-
-        The script runs AFTER the app exits, so there are no file-lock
-        issues when replacing the .app bundle in /Applications.
-
-        Flow:
-        1. Write a temp shell script that will:
-           a. Wait for this process to exit
-           b. Mount the DMG
-           c. Copy the .app to /Applications
-           d. Unmount the DMG
-           e. Relaunch the new .app
-           f. Clean up
-        2. Launch the script in the background
-        3. Exit the current app immediately
+        Windows auto-install using a .bat script.
+        Can't overwrite a running .exe, so:
+        1. Write a batch script that waits for this process to exit
+        2. Replaces the old .exe with the new one
+        3. Relaunches from the original location
+        4. Cleans up temp files
         """
-        import tempfile
+        import time
+
+        # sys.executable = the currently running .exe (original location)
+        current_exe = os.path.realpath(sys.executable)
+        my_pid = os.getpid()
 
         _status("Preparing update...")
 
-        # Build a shell script that does the heavy lifting after we quit
-        script_content = f'''#!/bin/bash
-# Wait for the current app to fully exit
-sleep 2
+        bat_content = f'''@echo off
+:: Wait for the current app to exit (check every second, up to 30s)
+set /a count=0
+:waitloop
+tasklist /FI "PID eq {my_pid}" 2>NUL | find /I "{my_pid}" >NUL
+if errorlevel 1 goto :done_waiting
+set /a count+=1
+if %count% geq 30 goto :done_waiting
+timeout /t 1 /nobreak >NUL
+goto :waitloop
+:done_waiting
 
-# Mount the DMG
-MOUNT_OUTPUT=$(hdiutil attach "{dmg_path}" -nobrowse -noverify -noautoopen 2>&1)
-if [ $? -ne 0 ]; then
-    osascript -e 'display alert "Update Failed" message "Could not mount the disk image. Please install manually from the Downloads folder."'
-    exit 1
-fi
+:: Small extra pause
+timeout /t 1 /nobreak >NUL
 
-# Find mount point (last column of last line)
-MOUNT_POINT=$(echo "$MOUNT_OUTPUT" | tail -1 | awk '{{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}}' | sed 's/ *$//')
+:: Replace the old exe with the new one
+del /f /q "{current_exe}" >NUL 2>&1
+if exist "{current_exe}" (
+    timeout /t 2 /nobreak >NUL
+    del /f /q "{current_exe}" >NUL 2>&1
+)
 
-if [ ! -d "$MOUNT_POINT" ]; then
-    osascript -e 'display alert "Update Failed" message "Could not find mounted volume."'
-    exit 1
-fi
+copy /y "{new_exe_path}" "{current_exe}" >NUL 2>&1
+if errorlevel 1 (
+    :: Copy failed — try move instead
+    move /y "{new_exe_path}" "{current_exe}" >NUL 2>&1
+)
 
-# Find the .app inside
-APP_NAME=$(ls "$MOUNT_POINT" | grep '\\.app$' | head -1)
-if [ -z "$APP_NAME" ]; then
-    hdiutil detach "$MOUNT_POINT" -quiet 2>/dev/null
-    osascript -e 'display alert "Update Failed" message "No application found in the disk image."'
-    exit 1
-fi
+if not exist "{current_exe}" (
+    :: Last resort: put the new exe back as-is
+    copy /y "{new_exe_path}" "{current_exe}" >NUL 2>&1
+)
 
-SOURCE="$MOUNT_POINT/$APP_NAME"
-DEST="/Applications/$APP_NAME"
+:: Clean up downloaded file
+del /f /q "{new_exe_path}" >NUL 2>&1
 
-# Remove old version and copy new one
-rm -rf "$DEST" 2>/dev/null
-cp -R "$SOURCE" "$DEST"
+:: Relaunch the updated app
+start "" "{current_exe}"
 
-if [ $? -ne 0 ]; then
-    hdiutil detach "$MOUNT_POINT" -quiet 2>/dev/null
-    osascript -e 'display alert "Update Failed" message "Could not copy to Applications. Try dragging the app manually."'
-    open "$MOUNT_POINT"
-    exit 1
-fi
-
-# Unmount and clean up
-hdiutil detach "$MOUNT_POINT" -quiet 2>/dev/null
-rm -f "{dmg_path}" 2>/dev/null
-
-# Relaunch
-sleep 1
-open -n -a "$DEST"
-
-# Delete this script
-rm -f "$0"
+:: Delete this batch file
+del /f /q "%~f0"
 '''
 
-        # Write script to temp file
-        script_path = os.path.join(tempfile.gettempdir(), "anemi_update.sh")
-        with open(script_path, "w") as f:
-            f.write(script_content)
-        os.chmod(script_path, 0o755)
+        bat_path = os.path.join(tempfile.gettempdir(), "anemi_update.bat")
+        with open(bat_path, "w") as f:
+            f.write(bat_content)
 
         _status("Installing update — app will restart...")
 
-        # Launch the script in background and exit
+        # Launch the batch script hidden and detached
         subprocess.Popen(
-            ["/bin/bash", script_path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
+            ["cmd", "/c", bat_path],
+            creationflags=0x08000000,  # CREATE_NO_WINDOW
+            close_fds=True,
         )
 
-        import time
         time.sleep(0.5)
         os._exit(0)
+
+    def _install_mac(self, dmg_path, _status):
+        """
+        macOS auto-install — all done in-process (no shell script).
+        1. Mount the DMG
+        2. Find the .app inside
+        3. Copy it to /Applications (replacing old version)
+        4. Unmount the DMG
+        5. Relaunch from /Applications
+        """
+        mount_point = None
+
+        try:
+            # ── Step 1: Mount DMG ────────────────────────────────────────
+            _status("Mounting disk image...")
+            result = subprocess.run(
+                ["hdiutil", "attach", dmg_path,
+                 "-nobrowse", "-noverify", "-noautoopen"],
+                capture_output=True, text=True, timeout=60
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"Failed to mount DMG: {result.stderr}")
+
+            # Parse mount point from hdiutil output (tab-separated)
+            for line in result.stdout.strip().split("\n"):
+                parts = line.split("\t")
+                if len(parts) >= 3:
+                    mount_point = parts[-1].strip()
+
+            if not mount_point or not os.path.isdir(mount_point):
+                raise RuntimeError("Could not determine DMG mount point.")
+
+            # ── Step 2: Find the .app ────────────────────────────────────
+            _status("Finding application...")
+            app_name = None
+            for item in os.listdir(mount_point):
+                if item.endswith(".app"):
+                    app_name = item
+                    break
+
+            if not app_name:
+                raise RuntimeError("No .app found inside the DMG.")
+
+            source_app = os.path.join(mount_point, app_name)
+            dest_app = os.path.join("/Applications", app_name)
+
+            # ── Step 3: Remove old version and copy new one ──────────────
+            _status("Installing update...")
+            if os.path.exists(dest_app):
+                shutil.rmtree(dest_app)
+
+            shutil.copytree(source_app, dest_app)
+            _status("Update installed!")
+
+            # ── Step 4: Unmount DMG ──────────────────────────────────────
+            try:
+                subprocess.run(
+                    ["hdiutil", "detach", mount_point, "-quiet"],
+                    timeout=30, capture_output=True
+                )
+            except Exception:
+                pass  # Non-critical
+
+            # Clean up downloaded DMG
+            try:
+                os.remove(dmg_path)
+            except Exception:
+                pass
+
+            # ── Step 5: Relaunch ─────────────────────────────────────────
+            _status("Relaunching...")
+            import time
+            time.sleep(1)  # brief pause to let OS release locks
+            subprocess.Popen(["open", "-n", "-a", dest_app])
+            time.sleep(0.5)
+            os._exit(0)  # force-kill current process
+
+        except Exception as e:
+            # Try to unmount on error
+            if mount_point:
+                try:
+                    subprocess.run(
+                        ["hdiutil", "detach", mount_point, "-quiet"],
+                        timeout=15, capture_output=True
+                    )
+                except Exception:
+                    pass
+            raise RuntimeError(f"macOS install failed: {e}")
+
+    def is_mandatory_update(self, server_data):
+        """Returns True if the update is mandatory or below minimum version."""
+        if server_data.get("mandatory", False):
+            return True
+        minimum = server_data.get("minimum_version", "0.0.0")
+        if compare_versions(self.current_version, minimum) < 0:
+            return True
+        return False
+
+    def silent_auto_update(self):
+        """
+        Fully silent auto-update. Call BEFORE launching the main app.
+        - Checks GitHub for a new version
+        - If found, downloads and installs silently
+        - Relaunches the new version, exits current process
+        - If no update or any error, returns silently so the app can start normally
+        """
+        try:
+            result = self.check_for_updates()
+        except Exception:
+            return  # No internet or error — skip silently
+
+        if not result.get("update_available"):
+            return  # Already up to date
+
+        url = result.get("download_url", "")
+        checksum = result.get("checksum", "")
+
+        if not url:
+            return  # No download URL — skip
+
+        try:
+            # Download
+            installer_path = self.download_update(url, checksum)
+            # Install and relaunch (this calls os._exit on success)
+            self.install_update(installer_path)
+        except Exception:
+            return  # Download or install failed — skip, launch current version
 
     def check_and_prompt(self, parent_window=None):
         """

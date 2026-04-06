@@ -2,16 +2,20 @@
 Version Manager — reads local version, compares semver strings.
 """
 
+import sys
 from pathlib import Path
 
 
 def get_version(version_file=None):
     """
     Read current version from version.txt in the app root.
+    Works both in dev and inside a PyInstaller bundle (sys._MEIPASS).
     Returns version string like '1.0.0' or '0.0.0' if not found.
     """
     if version_file is None:
-        version_file = Path(__file__).parent.parent / "version.txt"
+        # PyInstaller sets sys._MEIPASS to the temp extraction folder
+        base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent.parent))
+        version_file = base / "version.txt"
     else:
         version_file = Path(version_file)
 
