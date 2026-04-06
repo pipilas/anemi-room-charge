@@ -1,9 +1,9 @@
 {
-  "latest_version": "1.2.77",
+  "latest_version": "1.2.78",
   "minimum_version": "1.0.0",
-  "release_date": "2026-04-01",
-  "download_url_windows": "",
-  "download_url_mac": "",
+  "release_date": "2026-04-06",
+  "download_url_windows": "https://github.com/pipilas/anemi-room-charge/releases/download/v1.2.78/RoomChargeAndSales.exe",
+  "download_url_mac": "https://github.com/pipilas/anemi-room-charge/releases/download/v1.2.78/RoomChargeAndSales-1.2.78-mac.dmg",
   "release_notes": "Fix auto-updater: read version from version.txt, update app in-place instead of always /Applications",
   "mandatory": false,
   "checksum_sha256": ""
