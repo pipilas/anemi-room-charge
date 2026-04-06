@@ -196,11 +196,7 @@ class Updater:
                     pass
 
         if IS_WIN:
-            _status("Launching installer...")
-            subprocess.Popen([installer_path], shell=True)
-            import time
-            time.sleep(0.5)
-            os._exit(0)
+            self._install_windows(installer_path, _status)
         elif IS_MAC:
             self._install_mac(installer_path, _status)
         else:
@@ -208,6 +204,86 @@ class Updater:
             _status("Opening installer...")
             subprocess.Popen(["xdg-open", installer_path])
             os._exit(0)
+
+    def _install_windows(self, installer_path, _status):
+        """
+        Windows auto-install using a background batch script.
+
+        The script runs AFTER the app exits, so the exe is no longer locked.
+
+        Flow:
+        1. Write a temp batch script that will:
+           a. Wait for this process to exit
+           b. Copy the new exe over the old one
+           c. Relaunch from the original location
+           d. Clean up
+        2. Launch the script in the background
+        3. Exit the current app immediately
+        """
+        _status("Preparing update...")
+
+        # Determine where the currently running exe lives
+        if getattr(sys, 'frozen', False):
+            current_exe = sys.executable
+        else:
+            # Running from source — just launch the new exe directly
+            _status("Launching update...")
+            subprocess.Popen([installer_path], shell=True)
+            import time
+            time.sleep(0.5)
+            os._exit(0)
+
+        pid = os.getpid()
+
+        script_content = f'''@echo off
+:: Wait for the current app to fully exit
+:wait_loop
+tasklist /FI "PID eq {pid}" 2>NUL | find /I "{pid}" >NUL
+if not errorlevel 1 (
+    timeout /t 1 /nobreak >NUL
+    goto wait_loop
+)
+
+:: Small extra delay for file locks to release
+timeout /t 1 /nobreak >NUL
+
+:: Replace the old exe with the new one
+copy /Y "{installer_path}" "{current_exe}"
+if errorlevel 1 (
+    echo Update failed — could not replace the application.
+    echo Please copy the new version manually from:
+    echo   {installer_path}
+    pause
+    exit /b 1
+)
+
+:: Clean up the downloaded file
+del /f "{installer_path}" 2>NUL
+
+:: Relaunch the app from its original location
+start "" "{current_exe}"
+
+:: Delete this batch script
+del /f "%~f0"
+'''
+
+        script_path = os.path.join(tempfile.gettempdir(), "anemi_update.bat")
+        with open(script_path, "w") as f:
+            f.write(script_content)
+
+        _status("Installing update — app will restart...")
+
+        # Launch the batch script hidden and detached
+        subprocess.Popen(
+            ["cmd.exe", "/c", script_path],
+            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        import time
+        time.sleep(0.5)
+        os._exit(0)
 
     def _install_mac(self, dmg_path, _status):
         """
