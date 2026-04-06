@@ -246,16 +246,25 @@ class Updater:
             # Step 2: Copy the new exe to the original location
             shutil.copy2(new_exe_path, str(current_exe))
 
+            # Verify the copy succeeded and file size matches
+            new_size = Path(new_exe_path).stat().st_size
+            copied_size = current_exe.stat().st_size
+            if copied_size != new_size:
+                raise RuntimeError(
+                    f"Copy verification failed: expected {new_size} bytes, "
+                    f"got {copied_size} bytes")
+
             # Step 3: Clean up the downloaded temp file
             try:
                 Path(new_exe_path).unlink()
             except Exception:
                 pass
 
-            # Step 4: Launch the new exe and exit
+            # Step 4: Wait for filesystem to settle, then launch and exit
             _status("Restarting with new version...")
+            time.sleep(2)
             subprocess.Popen([str(current_exe)])
-            time.sleep(0.5)
+            time.sleep(1)
             os._exit(0)
 
         except Exception as e:

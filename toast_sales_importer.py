@@ -3820,10 +3820,7 @@ class App(tk.Tk):
                 else:
                     self.after(0, lambda: messagebox.showinfo(
                         "Up to Date",
-                        f"You are running the latest version ({APP_VERSION}).\n\n"
-                        f"[Debug] Local: {result.get('current_version')}\n"
-                        f"[Debug] Remote: {result.get('latest_version')}\n"
-                        f"[Debug] URL: {result.get('download_url', 'none')}",
+                        f"You are running the latest version ({APP_VERSION}).",
                         parent=self))
 
             threading.Thread(target=_worker, daemon=True).start()
