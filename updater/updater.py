@@ -209,79 +209,63 @@ class Updater:
 
     def _install_windows(self, new_exe_path, _status):
         """
-        Windows auto-install using a .bat script.
-        Can't overwrite a running .exe, so:
-        1. Write a batch script that waits for this process to exit
-        2. Replaces the old .exe with the new one
-        3. Relaunches from the original location
-        4. Cleans up temp files
+        Windows auto-install using rename-and-replace (no batch scripts).
+
+        Windows allows RENAMING a running exe, just not deleting or overwriting it.
+        So we:
+        1. Rename current exe → .exe.old  (allowed while running)
+        2. Copy new exe → original path
+        3. Launch the new exe
+        4. Exit this process
+        On next startup, the .exe.old gets cleaned up.
         """
         import time
 
-        # sys.executable = the currently running .exe (original location)
-        current_exe = os.path.realpath(sys.executable)
-        my_pid = os.getpid()
+        # If not running as a frozen PyInstaller exe, just launch the new one
+        if not getattr(sys, 'frozen', False):
+            _status("Launching update...")
+            subprocess.Popen([new_exe_path], shell=True)
+            time.sleep(0.5)
+            os._exit(0)
 
-        _status("Preparing update...")
+        current_exe = Path(sys.executable)
+        backup_exe = current_exe.with_name(current_exe.name + '.old')
 
-        bat_content = f'''@echo off
-:: Wait for the current app to exit (check every second, up to 30s)
-set /a count=0
-:waitloop
-tasklist /FI "PID eq {my_pid}" 2>NUL | find /I "{my_pid}" >NUL
-if errorlevel 1 goto :done_waiting
-set /a count+=1
-if %count% geq 30 goto :done_waiting
-timeout /t 1 /nobreak >NUL
-goto :waitloop
-:done_waiting
+        try:
+            # Remove leftover backup from a previous update
+            if backup_exe.exists():
+                try:
+                    backup_exe.unlink()
+                except Exception:
+                    pass
 
-:: Small extra pause
-timeout /t 1 /nobreak >NUL
+            # Step 1: Rename the running exe (Windows allows this)
+            _status("Applying update...")
+            current_exe.rename(backup_exe)
 
-:: Replace the old exe with the new one
-del /f /q "{current_exe}" >NUL 2>&1
-if exist "{current_exe}" (
-    timeout /t 2 /nobreak >NUL
-    del /f /q "{current_exe}" >NUL 2>&1
-)
+            # Step 2: Copy the new exe to the original location
+            shutil.copy2(new_exe_path, str(current_exe))
 
-copy /y "{new_exe_path}" "{current_exe}" >NUL 2>&1
-if errorlevel 1 (
-    :: Copy failed — try move instead
-    move /y "{new_exe_path}" "{current_exe}" >NUL 2>&1
-)
+            # Step 3: Clean up the downloaded temp file
+            try:
+                Path(new_exe_path).unlink()
+            except Exception:
+                pass
 
-if not exist "{current_exe}" (
-    :: Last resort: put the new exe back as-is
-    copy /y "{new_exe_path}" "{current_exe}" >NUL 2>&1
-)
+            # Step 4: Launch the new exe and exit
+            _status("Restarting with new version...")
+            subprocess.Popen([str(current_exe)])
+            time.sleep(0.5)
+            os._exit(0)
 
-:: Clean up downloaded file
-del /f /q "{new_exe_path}" >NUL 2>&1
-
-:: Relaunch the updated app
-start "" "{current_exe}"
-
-:: Delete this batch file
-del /f /q "%~f0"
-'''
-
-        bat_path = os.path.join(tempfile.gettempdir(), "anemi_update.bat")
-        with open(bat_path, "w") as f:
-            f.write(bat_content)
-
-        _status("Installing update — app will restart...")
-
-        # Launch the batch script hidden and detached
-        subprocess.Popen(
-            ["cmd", "/c", bat_path],
-            creationflags=0x08000000,  # CREATE_NO_WINDOW
-            close_fds=True,
-        )
-
-        time.sleep(0.5)
-        os._exit(0)
+        except Exception as e:
+            # If rename succeeded but copy failed, restore the original
+            if backup_exe.exists() and not current_exe.exists():
+                try:
+                    backup_exe.rename(current_exe)
+                except Exception:
+                    pass
+            raise RuntimeError(f"Update failed: {e}")
 
     def _install_mac(self, dmg_path, _status):
         """
@@ -387,58 +371,4 @@ del /f /q "%~f0"
         - If found, downloads and installs silently
         - Relaunches the new version, exits current process
         - If no update or any error, returns silently so the app can start normally
-        """
-        try:
-            result = self.check_for_updates()
-        except Exception:
-            return  # No internet or error — skip silently
-
-        if not result.get("update_available"):
-            return  # Already up to date
-
-        url = result.get("download_url", "")
-        checksum = result.get("checksum", "")
-
-        if not url:
-            return  # No download URL — skip
-
-        try:
-            # Download
-            installer_path = self.download_update(url, checksum)
-            # Install and relaunch (this calls os._exit on success)
-            self.install_update(installer_path)
-        except Exception:
-            return  # Download or install failed — skip, launch current version
-
-    def check_and_prompt(self, parent_window=None):
-        """
-        Check for updates in a background thread.
-        If update found, shows the update dialog.
-        Never blocks or slows down app launch.
-        If no internet or check fails, silently skips.
-        """
-        def _worker():
-            try:
-                result = self.check_for_updates()
-            except Exception:
-                return  # Silently skip
-
-            if not result.get("update_available"):
-                return
-
-            # Schedule dialog on main thread
-            if parent_window:
-                delay = 50 if result.get("mandatory") else 500
-                try:
-                    parent_window.after(delay, lambda: _show(result))
-                except Exception:
-                    pass
-
-        def _show(result):
-            try:
-                from .update_dialog import show_update_dialog
-                show_update_dialog(parent_window, self, result)
-            except Exception:
-                pass
-
-        threading.Thread(target=_worker, daemon=True).start()
+        "
