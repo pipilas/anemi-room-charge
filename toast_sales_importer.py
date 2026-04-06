@@ -85,15 +85,6 @@ APP_VERSION = _read_version()
 GITHUB_USERNAME = "pipilas"
 GITHUB_REPO = "anemi-room-charge"
 
-# ── Clean up old exe from a previous update ────────────────────────────
-if getattr(sys, 'frozen', False):
-    _old_exe = Path(sys.executable).with_suffix('.exe.old')
-    if _old_exe.exists():
-        try:
-            _old_exe.unlink()
-        except Exception:
-            pass
-
 # ── Updater (auto-download .app / .exe from GitHub Releases) ────────────
 try:
     from updater import Updater as _Updater
