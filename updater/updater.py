@@ -207,20 +207,16 @@ class Updater:
 
     def _install_windows(self, installer_path, _status):
         """
-        Windows auto-install using a background VBS-launched batch script.
+        Windows auto-install using rename-and-replace.
 
-        Flow:
-        1. Write a batch script that waits a few seconds (for the app to exit),
-           copies the new exe over the old one, relaunches, and cleans up.
-        2. Write a tiny VBS wrapper to launch the batch script fully hidden.
-        3. Run the VBS wrapper and immediately exit the app.
+        Windows allows renaming a running exe (but not overwriting or deleting).
+        So we: rename current exe → copy new exe to original path → relaunch → exit.
+        On next startup, the old renamed exe gets cleaned up.
         """
         _status("Preparing update...")
 
         # Determine where the currently running exe lives
-        if getattr(sys, 'frozen', False):
-            current_exe = sys.executable
-        else:
+        if not getattr(sys, 'frozen', False):
             # Running from source — just launch the new exe directly
             _status("Launching update...")
             subprocess.Popen([installer_path], shell=True)
@@ -228,45 +224,46 @@ class Updater:
             time.sleep(0.5)
             os._exit(0)
 
-        script_content = f'''@echo off
-:: Wait for the app to fully exit and release file locks
-timeout /t 4 /nobreak >NUL
+        current_exe = Path(sys.executable)
+        backup_exe = current_exe.with_suffix('.exe.old')
 
-:: Replace the old exe with the new one
-copy /Y "{installer_path}" "{current_exe}"
-if errorlevel 1 (
-    timeout /t 2 /nobreak >NUL
-    copy /Y "{installer_path}" "{current_exe}"
-)
+        try:
+            # Remove old backup from a previous update if it exists
+            if backup_exe.exists():
+                try:
+                    backup_exe.unlink()
+                except Exception:
+                    pass
 
-:: Clean up the downloaded file
-del /f "{installer_path}" 2>NUL
+            # Rename the running exe (Windows allows this!)
+            _status("Applying update...")
+            current_exe.rename(backup_exe)
 
-:: Relaunch the app from its original location
-start "" "{current_exe}"
+            # Copy the new exe to the original location
+            shutil.copy2(installer_path, str(current_exe))
 
-:: Delete this batch script
-del /f "%~f0"
-'''
+            # Clean up the downloaded temp file
+            try:
+                Path(installer_path).unlink()
+            except Exception:
+                pass
 
-        script_path = os.path.join(tempfile.gettempdir(), "anemi_update.bat")
-        with open(script_path, "w") as f:
-            f.write(script_content)
+            # Launch the new exe from the original location
+            _status("Restarting with new version...")
+            subprocess.Popen([str(current_exe)])
 
-        # VBS wrapper to run the batch script completely hidden
-        vbs_content = f'CreateObject("Wscript.Shell").Run """{script_path}""", 0, False\n'
-        vbs_path = os.path.join(tempfile.gettempdir(), "anemi_update.vbs")
-        with open(vbs_path, "w") as f:
-            f.write(vbs_content)
+            import time
+            time.sleep(0.5)
+            os._exit(0)
 
-        _status("Installing update — app will restart...")
-
-        # Launch via wscript (fully hidden, no window at all)
-        subprocess.Popen(["wscript.exe", vbs_path])
-
-        import time
-        time.sleep(0.5)
-        os._exit(0)
+        except Exception as e:
+            # If something went wrong, try to restore the original
+            if backup_exe.exists() and not current_exe.exists():
+                try:
+                    backup_exe.rename(current_exe)
+                except Exception:
+                    pass
+            raise RuntimeError(f"Update failed: {e}")
 
     def _install_mac(self, dmg_path, _status):
         """
