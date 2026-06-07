@@ -396,6 +396,28 @@ def check_order_exists(id_token: str, date_folder: str,
         return False
 
 
+def delete_order(id_token: str, date_folder: str, check_id: str) -> tuple[bool, str]:
+    """
+    Delete a single order from Firestore at /orders/{date_folder}_{check_id}.
+    Returns (True, doc_id) on success, (False, error_msg) on failure.
+    """
+    doc_id = f"{date_folder}_{check_id}"
+    url = f"{_FIRESTORE_URL}/orders/{doc_id}"
+    req = request.Request(
+        url,
+        headers={"Authorization": f"Bearer {id_token}"},
+        method="DELETE",
+    )
+    try:
+        with request.urlopen(req, timeout=15):
+            return True, doc_id
+    except error.HTTPError as e:
+        body = e.read().decode()
+        return False, f"HTTP {e.code}: {body[:200]}"
+    except Exception as exc:
+        return False, str(exc)
+
+
 def _parse_firestore_value(val_obj) -> object:
     """Convert a single Firestore value object back to Python."""
     if "stringValue" in val_obj:

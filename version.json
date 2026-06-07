@@ -4,7 +4,7 @@
   "release_date": "2026-04-01",
   "download_url_windows": "",
   "download_url_mac": "",
-  "release_notes": "Fix auto-updater: read version from version.txt, update app in-place instead of always /Applications",
+  "release_notes": "Edit and delete room charge orders and items, Firebase sync, fix Windows updater",
   "mandatory": false,
   "checksum_sha256": ""
 }

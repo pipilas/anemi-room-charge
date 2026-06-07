@@ -1227,9 +1227,14 @@ class DayDetailView(tk.Frame):
     """Shows all individual receipts for a single day as a scrollable list."""
 
     def __init__(self, parent, date_key: str,
-                 receipts: list[RoomChargeReceipt], on_back=None, **kw):
+                 receipts: list[RoomChargeReceipt], on_back=None,
+                 on_edit=None, on_delete=None, **kw):
         super().__init__(parent, bg=BG_NAV, **kw)
         self._on_back = on_back
+        self._on_edit = on_edit      # callback(receipt)
+        self._on_delete = on_delete  # callback(receipt)
+        self._date_key = date_key
+        self._receipts = receipts
 
         # Parse date
         try:
@@ -1392,7 +1397,26 @@ class DayDetailView(tk.Frame):
                     continue
         if time_str:
             tk.Label(hdr, text=time_str, bg=card_bg, fg=NAV_INACTIVE,
-                     font=(FONT, 11)).pack(side="right")
+                     font=(FONT, 11)).pack(side="right", padx=(0, 8))
+
+        # ── Edit / Delete buttons ─────────────────────────────────────
+        if self._on_delete:
+            del_lbl = tk.Label(hdr, text=" Delete ", bg="#EF4444", fg="#FFFFFF",
+                               font=(FONT, 9, "bold"), cursor="hand2",
+                               padx=4, pady=2)
+            del_lbl.pack(side="right", padx=(4, 0))
+            del_lbl.bind("<Button-1>", lambda e, rc=r: self._on_delete(rc))
+            del_lbl.bind("<Enter>", lambda e: del_lbl.config(bg="#DC2626"))
+            del_lbl.bind("<Leave>", lambda e: del_lbl.config(bg="#EF4444"))
+
+        if self._on_edit:
+            edit_lbl = tk.Label(hdr, text=" Edit ", bg="#2563EB", fg="#FFFFFF",
+                                font=(FONT, 9, "bold"), cursor="hand2",
+                                padx=4, pady=2)
+            edit_lbl.pack(side="right", padx=(4, 0))
+            edit_lbl.bind("<Button-1>", lambda e, rc=r: self._on_edit(rc))
+            edit_lbl.bind("<Enter>", lambda e: edit_lbl.config(bg="#1D4ED8"))
+            edit_lbl.bind("<Leave>", lambda e: edit_lbl.config(bg="#2563EB"))
 
         # ── Server/table info ─────────────────────────────────────────
         if r.server or r.table:
@@ -1464,6 +1488,249 @@ class DayDetailView(tk.Frame):
     def _go_back(self):
         if self._on_back:
             self._on_back()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  EDIT ORDER DIALOG
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class EditOrderDialog(tk.Toplevel):
+    """Dialog for editing all fields and items of a RoomChargeReceipt."""
+
+    def __init__(self, parent, receipt: RoomChargeReceipt, on_save=None):
+        super().__init__(parent)
+        self.receipt = receipt
+        self._on_save = on_save
+        self._items_data: list[dict] = []
+
+        self.title(f"Edit Check #{receipt.check_number}")
+        self.configure(bg=BG_CARD if 'BG_CARD' in dir() else "#FFFFFF")
+        self.geometry("520x680")
+        self.resizable(False, True)
+        self.transient(parent)
+        self.grab_set()
+
+        bg = "#FFFFFF"
+        fg = "#1C1C1E"
+        fg_sec = "#6B7280"
+        entry_bg = "#F3F4F6"
+        border = "#E5E7EB"
+
+        # ── Header ─────────────────────────────────────────────────────
+        hdr = tk.Frame(self, bg=ACCENT, height=44)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+        tk.Label(hdr, text=f"Edit Check #{receipt.check_number}",
+                 bg=ACCENT, fg="#FFFFFF",
+                 font=(FONT, 13, "bold")).pack(side="left", padx=20, pady=8)
+
+        # ── Scrollable body ────────────────────────────────────────────
+        body_canvas = tk.Canvas(self, bg=bg, highlightthickness=0)
+        body_scroll = ttk.Scrollbar(self, orient="vertical",
+                                     command=body_canvas.yview)
+        body = tk.Frame(body_canvas, bg=bg)
+        body.bind("<Configure>",
+                  lambda e: body_canvas.configure(scrollregion=body_canvas.bbox("all")))
+        body_canvas.create_window((0, 0), window=body, anchor="nw")
+        body_canvas.configure(yscrollcommand=body_scroll.set)
+        body_canvas.pack(side="left", fill="both", expand=True)
+        body_scroll.pack(side="right", fill="y")
+
+        pad = 20
+
+        def _field(label_text, default_val, row_parent=None):
+            p = row_parent or body
+            fr = tk.Frame(p, bg=bg)
+            fr.pack(fill="x", padx=pad, pady=(6, 0))
+            tk.Label(fr, text=label_text, bg=bg, fg=fg_sec,
+                     font=(FONT, 10)).pack(anchor="w")
+            var = tk.StringVar(value=str(default_val))
+            ent = tk.Entry(fr, textvariable=var, font=(FONT, 11),
+                           bg=entry_bg, fg=fg, relief="flat",
+                           highlightbackground=border, highlightthickness=1)
+            ent.pack(fill="x", pady=(2, 0), ipady=4)
+            return var
+
+        # ── Order fields ───────────────────────────────────────────────
+        tk.Label(body, text="Order Details", bg=bg, fg=fg,
+                 font=(FONT, 12, "bold")).pack(anchor="w", padx=pad, pady=(12, 0))
+
+        self._v_check_num = _field("Check Number", receipt.check_number)
+        self._v_tab_name = _field("Tab / Room Name", receipt.tab_name)
+        self._v_server = _field("Server", receipt.server)
+        self._v_table = _field("Table", receipt.table)
+        self._v_paid_date = _field("Paid Date", receipt.paid_date)
+
+        # Charge type dropdown
+        ct_frame = tk.Frame(body, bg=bg)
+        ct_frame.pack(fill="x", padx=pad, pady=(6, 0))
+        tk.Label(ct_frame, text="Charge Type", bg=bg, fg=fg_sec,
+                 font=(FONT, 10)).pack(anchor="w")
+        self._v_charge_type = tk.StringVar(value=receipt.charge_type)
+        ct_menu = ttk.Combobox(ct_frame, textvariable=self._v_charge_type,
+                                values=["Room Charge", "Hotel Charge", "Voucher"],
+                                state="readonly", font=(FONT, 11))
+        ct_menu.pack(fill="x", pady=(2, 0), ipady=2)
+
+        # ── Amounts ───────────────────────────────────────────────────
+        tk.Label(body, text="Amounts", bg=bg, fg=fg,
+                 font=(FONT, 12, "bold")).pack(anchor="w", padx=pad, pady=(14, 0))
+
+        self._v_subtotal = _field("Subtotal", f"{receipt.subtotal:.2f}")
+        self._v_tax = _field("Tax", f"{receipt.tax_total:.2f}")
+        self._v_tip = _field("Tip", f"{receipt.tip:.2f}")
+        self._v_total = _field("Total", f"{receipt.total:.2f}")
+
+        # ── Items section ─────────────────────────────────────────────
+        items_hdr = tk.Frame(body, bg=bg)
+        items_hdr.pack(fill="x", padx=pad, pady=(14, 0))
+        tk.Label(items_hdr, text="Items", bg=bg, fg=fg,
+                 font=(FONT, 12, "bold")).pack(side="left")
+
+        add_btn_frame = tk.Frame(items_hdr, bg=ACCENT, cursor="hand2")
+        add_btn_frame.pack(side="right")
+        add_lbl = tk.Label(add_btn_frame, text=" + Add Item ", bg=ACCENT,
+                           fg="#FFFFFF", font=(FONT, 9, "bold"),
+                           padx=6, pady=2, cursor="hand2")
+        add_lbl.pack()
+        for w in (add_btn_frame, add_lbl):
+            w.bind("<Button-1>", lambda e: self._add_item_row())
+
+        self._items_frame = tk.Frame(body, bg=bg)
+        self._items_frame.pack(fill="x", padx=pad, pady=(6, 0))
+
+        # Populate existing items
+        for item in receipt.items:
+            self._add_item_row(item.name, f"{item.qty:g}",
+                               f"{item.net_price:.2f}", f"{item.tax:.2f}")
+
+        # ── Buttons bar ──────────────────────────────────────────────
+        btn_bar = tk.Frame(self, bg=bg)
+        btn_bar.pack(fill="x", padx=pad, pady=(12, 16))
+
+        save_frame = tk.Frame(btn_bar, bg=ACCENT, cursor="hand2")
+        save_frame.pack(side="right")
+        save_lbl = tk.Label(save_frame, text="  Save Changes  ", bg=ACCENT,
+                            fg="#FFFFFF", font=(FONT, 11, "bold"),
+                            padx=12, pady=6, cursor="hand2")
+        save_lbl.pack()
+        for w in (save_frame, save_lbl):
+            w.bind("<Button-1>", lambda e: self._save())
+
+        cancel_frame = tk.Frame(btn_bar, bg="#F3F4F6", cursor="hand2",
+                                highlightbackground=border, highlightthickness=1)
+        cancel_frame.pack(side="right", padx=(0, 8))
+        cancel_lbl = tk.Label(cancel_frame, text="  Cancel  ", bg="#F3F4F6",
+                              fg="#374151", font=(FONT, 11),
+                              padx=12, pady=6, cursor="hand2")
+        cancel_lbl.pack()
+        for w in (cancel_frame, cancel_lbl):
+            w.bind("<Button-1>", lambda e: self.destroy())
+
+    def _add_item_row(self, name="", qty="1", price="0.00", tax="0.00"):
+        """Add an editable item row."""
+        bg = "#FFFFFF"
+        border = "#E5E7EB"
+        entry_bg = "#F3F4F6"
+        fg = "#1C1C1E"
+        fg_sec = "#6B7280"
+
+        row = tk.Frame(self._items_frame, bg=bg)
+        row.pack(fill="x", pady=(4, 0))
+
+        item_data = {}
+
+        # Name
+        name_var = tk.StringVar(value=name)
+        tk.Label(row, text="Name:", bg=bg, fg=fg_sec,
+                 font=(FONT, 9)).pack(side="left")
+        name_ent = tk.Entry(row, textvariable=name_var, font=(FONT, 10),
+                            bg=entry_bg, fg=fg, width=18, relief="flat",
+                            highlightbackground=border, highlightthickness=1)
+        name_ent.pack(side="left", padx=(2, 6), ipady=2)
+
+        # Qty
+        qty_var = tk.StringVar(value=qty)
+        tk.Label(row, text="Qty:", bg=bg, fg=fg_sec,
+                 font=(FONT, 9)).pack(side="left")
+        tk.Entry(row, textvariable=qty_var, font=(FONT, 10),
+                 bg=entry_bg, fg=fg, width=4, relief="flat",
+                 highlightbackground=border, highlightthickness=1
+                 ).pack(side="left", padx=(2, 6), ipady=2)
+
+        # Price
+        price_var = tk.StringVar(value=price)
+        tk.Label(row, text="Price:", bg=bg, fg=fg_sec,
+                 font=(FONT, 9)).pack(side="left")
+        tk.Entry(row, textvariable=price_var, font=(FONT, 10),
+                 bg=entry_bg, fg=fg, width=8, relief="flat",
+                 highlightbackground=border, highlightthickness=1
+                 ).pack(side="left", padx=(2, 6), ipady=2)
+
+        # Tax
+        tax_var = tk.StringVar(value=tax)
+        tk.Label(row, text="Tax:", bg=bg, fg=fg_sec,
+                 font=(FONT, 9)).pack(side="left")
+        tk.Entry(row, textvariable=tax_var, font=(FONT, 10),
+                 bg=entry_bg, fg=fg, width=7, relief="flat",
+                 highlightbackground=border, highlightthickness=1
+                 ).pack(side="left", padx=(2, 4), ipady=2)
+
+        # Delete item button
+        del_lbl = tk.Label(row, text=" ✕ ", bg="#EF4444", fg="#FFFFFF",
+                           font=(FONT, 9, "bold"), cursor="hand2",
+                           padx=4, pady=1)
+        del_lbl.pack(side="right")
+
+        item_data = {"name": name_var, "qty": qty_var,
+                     "price": price_var, "tax": tax_var, "row": row}
+        self._items_data.append(item_data)
+
+        def _remove(d=item_data):
+            d["row"].destroy()
+            if d in self._items_data:
+                self._items_data.remove(d)
+
+        del_lbl.bind("<Button-1>", lambda e: _remove())
+
+    def _save(self):
+        """Collect all fields, update the receipt, and call on_save."""
+        try:
+            r = self.receipt
+            r.check_number = self._v_check_num.get().strip()
+            r.tab_name = self._v_tab_name.get().strip()
+            r.server = self._v_server.get().strip()
+            r.table = self._v_table.get().strip()
+            r.paid_date = self._v_paid_date.get().strip()
+            r.charge_type = self._v_charge_type.get()
+            r.subtotal = float(self._v_subtotal.get() or 0)
+            r.tax_total = float(self._v_tax.get() or 0)
+            r.tip = float(self._v_tip.get() or 0)
+            r.total = float(self._v_total.get() or 0)
+
+            # Rebuild items list
+            new_items = []
+            for d in self._items_data:
+                if not d["row"].winfo_exists():
+                    continue
+                item_name = d["name"].get().strip()
+                if not item_name:
+                    continue
+                new_items.append(ReceiptItem(
+                    name=item_name,
+                    qty=float(d["qty"].get() or 1),
+                    net_price=float(d["price"].get() or 0),
+                    tax=float(d["tax"].get() or 0),
+                ))
+            r.items = new_items
+
+            if self._on_save:
+                self._on_save(r)
+            self.destroy()
+        except ValueError as exc:
+            messagebox.showerror("Invalid Input",
+                                 f"Please check your numbers:\n{exc}",
+                                 parent=self)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3036,8 +3303,99 @@ class App(tk.Tk):
         self._main.pack_forget()
         self._detail = DayDetailView(
             self, date_key=date_key, receipts=receipts,
-            on_back=self._close_day_detail)
+            on_back=self._close_day_detail,
+            on_edit=lambda r: self._edit_receipt(r, date_key, receipts),
+            on_delete=lambda r: self._delete_receipt(r, date_key, receipts))
         self._detail.pack(fill="both", expand=True)
+
+    def _edit_receipt(self, receipt: RoomChargeReceipt,
+                      date_key: str, receipts: list):
+        """Open the edit dialog for a receipt, then sync to Firebase."""
+        def _on_save(updated: RoomChargeReceipt):
+            # Upload updated order to Firebase
+            if AUTH_OK and hasattr(self, "_id_token") and self._id_token:
+                order_dict = {
+                    "date_folder": updated.date_folder,
+                    "check_id": updated.check_id,
+                    "check_number": updated.check_number,
+                    "tab_name": updated.tab_name,
+                    "server": updated.server,
+                    "table": updated.table,
+                    "paid_date": updated.paid_date,
+                    "subtotal": updated.subtotal,
+                    "tax_total": updated.tax_total,
+                    "tip": updated.tip,
+                    "total": updated.total,
+                    "charge_type": updated.charge_type,
+                    "items": [{"name": it.name, "qty": it.qty,
+                               "net_price": it.net_price, "tax": it.tax}
+                              for it in updated.items],
+                }
+                def _upload():
+                    ok, msg = auth.upload_order(self._id_token, order_dict)
+                    if ok:
+                        self.after(0, lambda: Toast(self, "Order saved to cloud!"))
+                    else:
+                        self.after(0, lambda: messagebox.showerror(
+                            "Save Error",
+                            f"Could not save to Firebase:\n{msg}",
+                            parent=self))
+                threading.Thread(target=_upload, daemon=True).start()
+
+            # Refresh the day detail view
+            self._close_day_detail()
+            self._show_day(date_key, receipts)
+
+        EditOrderDialog(self, receipt, on_save=_on_save)
+
+    def _delete_receipt(self, receipt: RoomChargeReceipt,
+                        date_key: str, receipts: list):
+        """Delete a receipt after confirmation, remove from Firebase."""
+        confirm = messagebox.askyesno(
+            "Delete Receipt",
+            f"Delete Check #{receipt.check_number} "
+            f"({receipt.charge_type}, ${receipt.total:,.2f})?\n\n"
+            "This will remove it from the cloud as well.",
+            parent=self)
+        if not confirm:
+            return
+
+        # Remove from the local list
+        receipts[:] = [r for r in receipts
+                       if not (r.date_folder == receipt.date_folder
+                               and r.check_id == receipt.check_id)]
+
+        # Remove from in-memory cache
+        if hasattr(self, "_all_receipts_cache"):
+            cache_key = receipt.date_folder
+            if cache_key in self._all_receipts_cache:
+                self._all_receipts_cache[cache_key].pop(
+                    (receipt.date_folder, receipt.check_id), None)
+
+        # Delete from Firebase
+        if AUTH_OK and hasattr(self, "_id_token") and self._id_token:
+            def _fb_delete():
+                ok, msg = auth.delete_order(
+                    self._id_token, receipt.date_folder, receipt.check_id)
+                if ok:
+                    self.after(0, lambda: Toast(self, "Deleted from cloud!"))
+                else:
+                    self.after(0, lambda: messagebox.showerror(
+                        "Delete Error",
+                        f"Could not delete from Firebase:\n{msg}",
+                        parent=self))
+            threading.Thread(target=_fb_delete, daemon=True).start()
+
+        # Refresh view
+        self._close_day_detail()
+        if receipts:
+            self._show_day(date_key, receipts)
+        # Also refresh the calendar cards
+        all_receipts = getattr(self, "_last_receipts", [])
+        all_receipts[:] = [r for r in all_receipts
+                           if not (r.date_folder == receipt.date_folder
+                                   and r.check_id == receipt.check_id)]
+        self._refresh_calendar(all_receipts)
 
     def _show_day_sales(self, date_key: str,
                         receipts: list[RoomChargeReceipt] | None = None):
