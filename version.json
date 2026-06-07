@@ -1,10 +1,10 @@
 {
-  "latest_version": "3.01",
+  "latest_version": "3.02",
   "minimum_version": "1.0.0",
   "release_date": "2026-06-07",
-  "download_url_windows": "https://github.com/pipilas/anemi-room-charge/releases/download/v3.01/RoomChargeAndSales.exe",
-  "download_url_mac": "https://github.com/pipilas/anemi-room-charge/releases/download/v3.01/RoomChargeAndSales-3.01-mac.dmg",
-  "release_notes": "Edit and delete room charge orders with Firebase sync, deleted orders blacklist",
+  "download_url_windows": "https://github.com/pipilas/anemi-room-charge/releases/download/v3.02/RoomChargeAndSales.exe",
+  "download_url_mac": "https://github.com/pipilas/anemi-room-charge/releases/download/v3.02/RoomChargeAndSales-3.02-mac.dmg",
+  "release_notes": "Lock edited orders from CSV overwrite, Firebase authoritative sync on startup",
   "mandatory": false,
   "checksum_sha256": ""
 }

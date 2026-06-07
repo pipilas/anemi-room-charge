@@ -227,6 +227,9 @@ def find_room_charges(export_dir: Path) -> list[RoomChargeReceipt]:
             # Skip orders that have been deleted (blacklisted)
             if is_order_deleted(date_folder, cid):
                 continue
+            # Skip orders that have been edited — Firebase version takes priority
+            if is_order_modified(date_folder, cid):
+                continue
 
             items = items_by_check.get(cid, [])
             subtotal = sum(i.net_price for i in items)
@@ -1526,6 +1529,42 @@ def save_deleted_order(date_folder: str, check_id: str):
 def is_order_deleted(date_folder: str, check_id: str) -> bool:
     """Check if an order has been deleted."""
     return f"{date_folder}_{check_id}" in load_deleted_orders()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MODIFIED ORDERS LOCK — edited orders skip CSV, Firebase version wins
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_MODIFIED_ORDERS_FILE = ".modified_orders.json"
+
+
+def _modified_orders_path() -> Path:
+    return _default_data_dir() / _MODIFIED_ORDERS_FILE
+
+
+def load_modified_orders() -> set[str]:
+    """Load set of modified order keys (date_folder_check_id)."""
+    p = _modified_orders_path()
+    if not p.exists():
+        return set()
+    try:
+        return set(json.loads(p.read_text()))
+    except Exception:
+        return set()
+
+
+def save_modified_order(date_folder: str, check_id: str):
+    """Mark an order as modified — CSV will be skipped, Firebase version used."""
+    modified = load_modified_orders()
+    modified.add(f"{date_folder}_{check_id}")
+    p = _modified_orders_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(sorted(modified)))
+
+
+def is_order_modified(date_folder: str, check_id: str) -> bool:
+    """Check if an order has been edited (locked to Firebase version)."""
+    return f"{date_folder}_{check_id}" in load_modified_orders()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3337,18 +3376,20 @@ class App(tk.Tk):
                     )
 
                 def _apply():
-                    # Merge Firebase receipts with any existing local ones
+                    # Merge: Firebase is authoritative — its version
+                    # replaces any matching local receipt (handles edits)
                     existing = getattr(self, "_last_receipts", [])
-                    existing_ids = {(r.date_folder, r.check_id) for r in existing}
-                    new_receipts = [r for r in receipts
-                                    if (r.date_folder, r.check_id)
-                                    not in existing_ids]
-                    merged = existing + new_receipts
+                    fb_ids = {(r.date_folder, r.check_id) for r in receipts}
+                    # Keep local receipts that are NOT in Firebase
+                    kept_local = [r for r in existing
+                                  if (r.date_folder, r.check_id)
+                                  not in fb_ids]
+                    # Firebase receipts + local-only receipts
+                    merged = receipts + kept_local
                     if merged or fb_sales_cache:
-                        # Merge Firebase sales into cache (only where local is missing)
+                        # Merge Firebase sales into cache (Firebase wins)
                         for key, summary in fb_sales_cache.items():
-                            if key not in self._sales_cache:
-                                self._sales_cache[key] = summary
+                            self._sales_cache[key] = summary
                         if merged:
                             self._refresh_calendar(merged)
                         elif fb_sales_cache:
@@ -3423,6 +3464,9 @@ class App(tk.Tk):
                     for it in updated.items
                 ],
             }
+
+            # Lock this order so CSV re-fetch won't overwrite the edit
+            save_modified_order(updated.date_folder, updated.check_id)
 
             # Upload to Firebase in background
             def _upload():
