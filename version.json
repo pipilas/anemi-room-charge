@@ -1,10 +1,10 @@
 {
-  "latest_version": "1.3",
+  "latest_version": "3.01",
   "minimum_version": "1.0.0",
-  "release_date": "2026-04-01",
-  "download_url_windows": "",
-  "download_url_mac": "",
-  "release_notes": "Edit and delete room charge orders and items, Firebase sync, fix Windows updater",
+  "release_date": "2026-06-07",
+  "download_url_windows": "https://github.com/pipilas/anemi-room-charge/releases/download/v3.01/RoomChargeAndSales.exe",
+  "download_url_mac": "https://github.com/pipilas/anemi-room-charge/releases/download/v3.01/RoomChargeAndSales-3.01-mac.dmg",
+  "release_notes": "Edit and delete room charge orders with Firebase sync, deleted orders blacklist",
   "mandatory": false,
   "checksum_sha256": ""
 }
