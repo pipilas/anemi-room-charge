@@ -1068,6 +1068,58 @@ def _save_settings(data: dict):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  WINDOWS AUTO-START — Register / unregister from Windows startup
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_STARTUP_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_STARTUP_APP_NAME = "RoomChargeAndSales"
+
+
+def _get_autostart_enabled() -> bool:
+    """Check if the app is registered to start on Windows boot."""
+    if platform.system() != "Windows":
+        return False
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_REG_KEY,
+                             0, winreg.KEY_READ)
+        try:
+            winreg.QueryValueEx(key, _STARTUP_APP_NAME)
+            return True
+        except FileNotFoundError:
+            return False
+        finally:
+            winreg.CloseKey(key)
+    except Exception:
+        return False
+
+
+def _set_autostart_enabled(enabled: bool):
+    """Register or unregister the app from Windows startup."""
+    if platform.system() != "Windows":
+        return
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_REG_KEY,
+                             0, winreg.KEY_SET_VALUE)
+        try:
+            if enabled:
+                # Use the currently running executable path
+                exe_path = os.path.realpath(sys.executable)
+                winreg.SetValueEx(key, _STARTUP_APP_NAME, 0,
+                                  winreg.REG_SZ, f'"{exe_path}"')
+            else:
+                try:
+                    winreg.DeleteValue(key, _STARTUP_APP_NAME)
+                except FileNotFoundError:
+                    pass  # Already removed
+        finally:
+            winreg.CloseKey(key)
+    except Exception:
+        pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  DESIGN SYSTEM — Stamhad Payroll v1.2
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1235,11 +1287,12 @@ class DayDetailView(tk.Frame):
 
     def __init__(self, parent, date_key: str,
                  receipts: list[RoomChargeReceipt], on_back=None,
-                 on_edit=None, on_delete=None, **kw):
+                 on_edit=None, on_delete=None, on_create=None, **kw):
         super().__init__(parent, bg=BG_NAV, **kw)
         self._on_back = on_back
         self._on_edit = on_edit
         self._on_delete = on_delete
+        self._on_create = on_create
 
         # Parse date
         try:
@@ -1262,6 +1315,21 @@ class DayDetailView(tk.Frame):
 
         tk.Label(top, text=title, bg=BG_NAV, fg="#FFFFFF",
                  font=(FONT, 18, "bold")).pack(side="left", padx=(16, 0))
+
+        # ── "+ Add Order" button ─────────────────────────────────────────
+        if self._on_create:
+            add_frame = tk.Frame(top, bg=ACCENT, cursor="hand2")
+            add_frame.pack(side="right", padx=(8, 0))
+            add_lbl = tk.Label(add_frame, text=" + Add Order ", bg=ACCENT,
+                               fg="#FFFFFF", font=(FONT, 10, "bold"),
+                               cursor="hand2", padx=8, pady=3)
+            add_lbl.pack()
+            for w in (add_frame, add_lbl):
+                w.bind("<Button-1>", lambda e: self._on_create())
+                w.bind("<Enter>", lambda e, f=add_frame, l=add_lbl: (
+                    f.config(bg=ACCENT_HV), l.config(bg=ACCENT_HV)))
+                w.bind("<Leave>", lambda e, f=add_frame, l=add_lbl: (
+                    f.config(bg=ACCENT), l.config(bg=ACCENT)))
 
         count = len(receipts)
         tk.Label(top, text=f"{count} receipt{'s' if count != 1 else ''}",
@@ -2816,6 +2884,11 @@ class App(tk.Tk):
         # Windows: auto-fetch weekly data silently on startup
         if IS_WIN and getattr(self, "_user_role", "admin") == "admin":
             self.after(2000, self._auto_fetch_silent)
+        # Windows: register in startup on first run (if not already set)
+        if IS_WIN and not self._settings.get("_autostart_checked"):
+            _set_autostart_enabled(True)
+            self._settings["_autostart_checked"] = True
+            _save_settings(self._settings)
 
     # ── Build the main screen (with inline calendar) ─────────────────────────
     def _build_ui(self):
@@ -3160,9 +3233,27 @@ class App(tk.Tk):
             elif has_sales_data:
                 tk.Label(card, text="No charges", bg=card_bg, fg="#3A5278",
                          font=(FONT, 9)).pack(pady=(4, 0))
+                # Allow adding a manual order
+                add_lbl = tk.Label(card, text="+ Add", bg=card_bg,
+                                   fg="#4A6A9A", font=(FONT, 9),
+                                   cursor="hand2")
+                add_lbl.pack(pady=(4, 0))
+                add_lbl.bind("<Button-1>",
+                             lambda e, d=key: self._create_receipt(d))
+                add_lbl.bind("<Enter>", lambda e, l=add_lbl: l.config(fg="#7EB8FF"))
+                add_lbl.bind("<Leave>", lambda e, l=add_lbl: l.config(fg="#4A6A9A"))
             else:
                 tk.Label(card, text="—", bg=card_bg, fg="#3A5278",
                          font=(FONT, 14)).pack(expand=True)
+                # Allow adding a manual order on empty dates
+                add_lbl = tk.Label(card, text="+ Add", bg=card_bg,
+                                   fg="#4A6A9A", font=(FONT, 9),
+                                   cursor="hand2")
+                add_lbl.pack(pady=(2, 0))
+                add_lbl.bind("<Button-1>",
+                             lambda e, d=key: self._create_receipt(d))
+                add_lbl.bind("<Enter>", lambda e, l=add_lbl: l.config(fg="#7EB8FF"))
+                add_lbl.bind("<Leave>", lambda e, l=add_lbl: l.config(fg="#4A6A9A"))
 
         # Hover effect
         if clickable:
@@ -3555,7 +3646,8 @@ class App(tk.Tk):
             self, date_key=date_key, receipts=receipts,
             on_back=self._close_day_detail,
             on_edit=lambda r: self._edit_receipt(r, date_key),
-            on_delete=lambda r: self._delete_receipt(r, date_key))
+            on_delete=lambda r: self._delete_receipt(r, date_key),
+            on_create=lambda: self._create_receipt(date_key))
         self._detail.pack(fill="both", expand=True)
 
     def _show_day_sales(self, date_key: str,
@@ -3694,6 +3786,94 @@ class App(tk.Tk):
         if day_receipts:
             self._show_day(date_key, day_receipts)
         self._refresh_calendar(self._last_receipts)
+
+    # ── Create new receipt manually ───────────────────────────────────────────
+
+    def _create_receipt(self, date_key: str):
+        """Open a blank EditOrderDialog to manually create a new order."""
+        import uuid
+
+        # Build a blank receipt for this date
+        blank = RoomChargeReceipt(
+            date_folder=date_key,
+            check_id=f"manual_{uuid.uuid4().hex[:8]}",
+            check_number="",
+            tab_name="",
+            server="",
+            table="",
+            paid_date="",
+            subtotal=0.0,
+            tax_total=0.0,
+            tip=0.0,
+            total=0.0,
+            charge_type="Room Charge",
+            items=[],
+        )
+
+        def _on_save(created: RoomChargeReceipt):
+            # Validate at least check number or tab name
+            if not created.check_number and not created.tab_name:
+                messagebox.showwarning(
+                    "Missing Info",
+                    "Please enter at least a check number or room/tab name.",
+                    parent=self)
+                return
+
+            # Mark as modified so CSV never overwrites
+            save_modified_order(created.date_folder, created.check_id)
+
+            # Build order dict for Firebase
+            order_data = {
+                "date_folder": created.date_folder,
+                "check_id": created.check_id,
+                "check_number": created.check_number,
+                "tab_name": created.tab_name,
+                "server": created.server,
+                "table": created.table,
+                "paid_date": created.paid_date,
+                "subtotal": created.subtotal,
+                "tax_total": created.tax_total,
+                "tip": created.tip,
+                "total": created.total,
+                "charge_type": created.charge_type,
+                "items": [
+                    {"name": it.name, "qty": it.qty,
+                     "net_price": it.net_price, "tax": it.tax}
+                    for it in created.items
+                ],
+            }
+
+            # Upload to Firebase in background
+            def _upload():
+                if AUTH_OK and self._id_token:
+                    try:
+                        ok, msg = auth.upload_order(self._id_token, order_data)
+                        if not ok:
+                            self.after(0, lambda: messagebox.showwarning(
+                                "Firebase Sync",
+                                f"Order saved locally but cloud sync failed:\n{msg}",
+                                parent=self))
+                    except Exception as exc:
+                        self.after(0, lambda: messagebox.showwarning(
+                            "Firebase Sync",
+                            f"Order saved locally but cloud sync failed:\n{exc}",
+                            parent=self))
+
+            threading.Thread(target=_upload, daemon=True).start()
+
+            # Add to local receipts
+            self._last_receipts.append(created)
+
+            # Refresh view
+            day_receipts = [r for r in self._last_receipts
+                           if r.date_folder == date_key]
+            if hasattr(self, "_detail") and self._detail.winfo_exists():
+                self._close_day_detail()
+            if day_receipts:
+                self._show_day(date_key, day_receipts)
+            self._refresh_calendar(self._last_receipts)
+
+        EditOrderDialog(self, blank, on_save=_on_save)
 
     # ── Button hover ──────────────────────────────────────────────────────────
     def _start_hover_in(self, _):
@@ -4493,7 +4673,7 @@ class SettingsDialog(tk.Toplevel):
 
         # Center on parent
         self.update_idletasks()
-        w, h = 560, 440
+        w, h = 560, (540 if IS_WIN else 440)
         px = parent.winfo_rootx() + (parent.winfo_width() - w) // 2
         py = parent.winfo_rooty() + (parent.winfo_height() - h) // 2
         self.geometry(f"{w}x{h}+{px}+{py}")
@@ -4547,6 +4727,24 @@ class SettingsDialog(tk.Toplevel):
             0, settings.get("output_folder", str(SFTP_DEFAULT_OUT)))
         Btn(row2, text="Browse", style="ghost",
             command=self._browse_out).pack(side="left", padx=(8, 0))
+
+        # ── Windows Auto-Start ────────────────────────────────────────────
+        if IS_WIN:
+            card3 = Card(body)
+            card3.pack(fill="x", pady=(0, 16))
+            tk.Label(card3, text="Windows Startup", bg=BG_CARD, fg=FG,
+                     font=(FONT, 12, "bold")).pack(anchor="w")
+            tk.Label(card3, text="Launch automatically when Windows starts",
+                     bg=BG_CARD, fg=FG_SEC, font=(FONT, 10)).pack(
+                         anchor="w", pady=(0, 6))
+            self._autostart_var = tk.BooleanVar(value=_get_autostart_enabled())
+            autostart_chk = tk.Checkbutton(
+                card3, text="Start with Windows",
+                variable=self._autostart_var,
+                bg=BG_CARD, fg=FG, activebackground=BG_CARD,
+                activeforeground=FG, selectcolor=BG_CARD,
+                font=(FONT, 11), anchor="w")
+            autostart_chk.pack(anchor="w")
 
         # ── Save / Cancel ────────────────────────────────────────────────
         btn_row = tk.Frame(body, bg=BG_PAGE)
@@ -4636,6 +4834,9 @@ class SettingsDialog(tk.Toplevel):
 
     def _save(self):
         self._settings["output_folder"] = self._out_inp.get().strip()
+        # Save Windows auto-start preference
+        if IS_WIN and hasattr(self, "_autostart_var"):
+            _set_autostart_enabled(self._autostart_var.get())
         _save_settings(self._settings)
         self._parent._settings = self._settings
         Toast(self._parent, "Settings saved!")

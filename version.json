@@ -1,10 +1,10 @@
 {
-  "latest_version": "3.02",
+  "latest_version": "3.03",
   "minimum_version": "1.0.0",
   "release_date": "2026-07-15",
-  "download_url_windows": "https://github.com/pipilas/anemi-room-charge/releases/download/v3.02/RoomChargeAndSales.exe",
-  "download_url_mac": "https://github.com/pipilas/anemi-room-charge/releases/download/v3.02/RoomChargeAndSales-3.02-mac.dmg",
-  "release_notes": "Auto-fetch on Windows startup, lock edited orders from CSV overwrite, Firebase authoritative sync",
+  "download_url_windows": "https://github.com/pipilas/anemi-room-charge/releases/download/v3.03/RoomChargeAndSales.exe",
+  "download_url_mac": "https://github.com/pipilas/anemi-room-charge/releases/download/v3.03/RoomChargeAndSales-3.03-mac.dmg",
+  "release_notes": "Windows auto-start on boot, manually create orders for any date",
   "mandatory": false,
   "checksum_sha256": ""
 }
