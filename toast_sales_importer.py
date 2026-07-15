@@ -2813,6 +2813,9 @@ class App(tk.Tk):
         # Auto-check for updates on launch (non-blocking)
         if UPDATER_OK and _app_updater:
             _app_updater.check_and_prompt(parent_window=self)
+        # Windows: auto-fetch weekly data silently on startup
+        if IS_WIN and getattr(self, "_user_role", "admin") == "admin":
+            self.after(2000, self._auto_fetch_silent)
 
     # ── Build the main screen (with inline calendar) ─────────────────────────
     def _build_ui(self):
@@ -3401,6 +3404,149 @@ class App(tk.Tk):
                 pass
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    # ── Silent auto-fetch (Windows) ──────────────────────────────────────────
+    def _auto_fetch_silent(self):
+        """
+        Windows-only: silently fetch the last 7 days of SFTP data on startup.
+        No UI prompts, no log panel — just download, generate receipts,
+        upload to Firebase, and refresh the calendar.
+        Skips silently if SSH key isn't available or fetch is already running.
+        """
+        if self._running:
+            return
+        if not PARAMIKO_OK or not REPORTLAB_OK:
+            return
+
+        # Try to resolve SSH key without any user interaction
+        key_path = self._resolve_ssh_key(interactive=False)
+        if not key_path:
+            return  # No key available — skip silently
+
+        out_dir = self._settings.get("output_folder", str(SFTP_DEFAULT_OUT))
+        today = datetime.date.today()
+        dates = [(today - datetime.timedelta(days=i)).strftime("%Y%m%d")
+                 for i in range(6, -1, -1)]
+
+        def _silent_worker():
+            downloaded = 0
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+            try:
+                pkey = paramiko.RSAKey.from_private_key_file(key_path)
+            except Exception:
+                return  # Can't load key — skip
+
+            try:
+                client.connect(
+                    hostname=SFTP_HOST, port=SFTP_PORT,
+                    username=SFTP_USERNAME, pkey=pkey,
+                    look_for_keys=False, allow_agent=False, timeout=30)
+                sftp = client.open_sftp()
+            except Exception:
+                return  # Can't connect — skip
+
+            try:
+                for date_folder in dates:
+                    remote_dir = f"/{SFTP_EXPORT_ID}/{date_folder}"
+                    local_dir = Path(out_dir) / date_folder
+
+                    try:
+                        sftp.stat(remote_dir)
+                    except IOError:
+                        continue  # No data for this date
+
+                    local_dir.mkdir(parents=True, exist_ok=True)
+
+                    for fname in SFTP_REQUIRED_FILES:
+                        remote_path = f"{remote_dir}/{fname}"
+                        local_path = local_dir / fname
+                        try:
+                            sftp.stat(remote_path)
+                        except IOError:
+                            continue  # File doesn't exist on server
+
+                        try:
+                            sftp.get(remote_path, str(local_path))
+                            downloaded += 1
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            finally:
+                client.close()
+
+            # Generate receipts from downloaded data
+            export_path = Path(out_dir)
+            try:
+                generate_all_receipts(export_path)
+            except Exception:
+                pass
+
+            all_receipts = find_room_charges(export_path)
+
+            # Upload to Firebase
+            if AUTH_OK and all_receipts and hasattr(self, "_id_token") and self._id_token:
+                order_dicts = []
+                for r in all_receipts:
+                    order_dicts.append({
+                        "date_folder": r.date_folder,
+                        "check_id": r.check_id,
+                        "check_number": r.check_number,
+                        "tab_name": r.tab_name,
+                        "server": r.server,
+                        "table": r.table,
+                        "paid_date": r.paid_date,
+                        "subtotal": r.subtotal,
+                        "tax_total": r.tax_total,
+                        "tip": r.tip,
+                        "total": r.total,
+                        "charge_type": r.charge_type,
+                        "items": [
+                            {"name": it.name, "qty": it.qty,
+                             "net_price": it.net_price, "tax": it.tax}
+                            for it in r.items
+                        ],
+                    })
+                try:
+                    auth.upload_orders_batch(self._id_token, order_dicts)
+                except Exception:
+                    pass
+
+                # Upload sales summaries too
+                sales_dicts = []
+                for dt in self._dates:
+                    key = dt.strftime("%Y%m%d")
+                    summary = compute_daily_sales(export_path, key)
+                    if summary:
+                        sales_dicts.append({
+                            "date_folder": key,
+                            "dayparts": [
+                                {"name": dp.name, "orders": dp.orders,
+                                 "net_sales": dp.net_sales, "tax": dp.tax,
+                                 "discount": dp.discount,
+                                 "gross_sales": dp.gross_sales}
+                                for dp in summary.dayparts
+                            ],
+                            "void_amount": summary.void_amount,
+                            "void_count": summary.void_count,
+                            "total_orders": summary.total_orders,
+                            "total_guests": summary.total_guests,
+                        })
+                if sales_dicts:
+                    try:
+                        auth.upload_sales_batch(self._id_token, sales_dicts)
+                    except Exception:
+                        pass
+
+            # Refresh calendar on main thread
+            if all_receipts:
+                self.after(0, lambda: self._refresh_calendar(all_receipts))
+            # Then sync from Firebase (authoritative merge)
+            self.after(500, self._load_from_firebase)
+
+        threading.Thread(target=_silent_worker, daemon=True).start()
 
     # ── Show day detail view ──────────────────────────────────────────────────
     def _show_day(self, date_key: str, receipts: list[RoomChargeReceipt]):
